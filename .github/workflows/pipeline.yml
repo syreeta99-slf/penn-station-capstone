@@ -1,0 +1,60 @@
+name: MTA Subway Static + Realtime + OneDrive
+
+on:
+  schedule:
+    # Weekday peaks (America/New_York) with UTC buffers, every 10 minutes
+    - cron: "*/10 10-15 * * 1-5"   # AM 06:00–11:59 ET (covers DST switch)
+    - cron: "*/10 20-23 * * 1-5"   # PM 16:00–19:59 ET
+    - cron: "*/10 0-1 * * 1-5"     # PM 20:00–21:59 ET
+    # Weekly static refresh (Sun 03:10 UTC)
+    - cron: "10 3 * * 0"
+  workflow_dispatch: {}  # allow manual run
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      # Refresh static GTFS weekly
+      - name: Refresh GTFS static (weekly)
+        if: github.event.schedule == '10 3 * * 0'
+        run: python pollers/mta_static_refresh.py
+
+      # Pull realtime (protobuf) every scheduled run
+      - name: Poll MTA Subway realtime
+        run: python pollers/mta_realtime_subway.py
+
+      # Build curated master
+      - name: Build Master dataset
+        run: python pollers/build_master.py
+
+      # Upload curated snapshots to OneDrive
+      - name: Install rclone
+        run: curl -fsSL https://rclone.org/install.sh | sudo bash
+
+      - name: Write rclone.conf from secret
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "${{ secrets.RCLONE_CONF }}" > ~/.config/rclone/rclone.conf
+          chmod 600 ~/.config/rclone/rclone.conf
+
+      - name: Copy to OneDrive
+        run: |
+          rclone copy data/curated onedrive:penn-station/curated --create-empty-src-dirs --checksum --transfers=4 --checkers=8
+
+      # (Optional) Save run artifacts
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: curated_${{ github.run_id }}
+          path: data/curated/*
+          retention-days: 30
