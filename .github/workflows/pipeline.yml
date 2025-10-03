@@ -40,6 +40,14 @@ jobs:
       # Pull realtime (protobuf) every scheduled run (and manual runs)
       - name: Poll MTA Subway realtime
         run: python pollers/mta_realtime_subway.py
+        # Upload the realtime CSVs so you can download them after the run
+        
+      - name: Upload realtime CSV artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: subway_realtime_csvs
+          path: data/realtime/*.csv
+          retention-days: 7
 
       # Build curated master (uses latest static ZIP + realtime)
       - name: Build Master dataset
