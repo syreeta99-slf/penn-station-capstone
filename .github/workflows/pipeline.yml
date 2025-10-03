@@ -37,20 +37,20 @@ jobs:
       - name: Build Master dataset
         run: python pollers/build_master.py
 
-      # Upload curated snapshots to OneDrive
+      # Upload curated snapshots to Google Drive
       - name: Install rclone
         run: curl -fsSL https://rclone.org/install.sh | sudo bash
 
-      - name: Write rclone.conf from secret
+      - name: Write rclone.conf from Base64 secret
         run: |
           mkdir -p ~/.config/rclone
-          echo "${{ secrets.RCLONE_CONF }}" > ~/.config/rclone/rclone.conf
+          echo "${{ secrets.RCLONE_CONF_B64 }}" | base64 -d > ~/.config/rclone/rclone.conf
           chmod 600 ~/.config/rclone/rclone.conf
 
-      - name: Copy to OneDrive
+      - name: Copy to Google Drive
         run: |
-          rclone copy data/curated onedrive:penn-station/curated --create-empty-src-dirs --checksum --transfers=4 --checkers=8
-
+          rclone copy data/curated googledrive:penn-station/curated \ --create-empty-src-dirs --checksum --transfers=4 --checkers=8
+          
       # (Optional) Save run artifacts
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
