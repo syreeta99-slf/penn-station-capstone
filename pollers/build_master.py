@@ -59,8 +59,9 @@ def parse_gtfs_time_to_dt(hms: str, service_date: str) -> pd.Timestamp:
     except Exception:
         return pd.NaT
     extra_days, h = divmod(h, 24)
-    base = datetime.fromisoformat(service_date).replace(tzinfo=timezone.utc)
-    return pd.Timestamp(base + timedelta(days=extra_days, hours=h, minutes=m, seconds=s), tz="UTC")
+  # tz-aware UTC base
+    base = pd.Timestamp(service_date).tz_localize("UTC")
+    return base + pd.Timedelta(days=extra_days, hours=h, minutes=m, seconds=s)
 
 def latest_static_zip() -> Path:
     zips = sorted(STATIC_DIR.glob("subway_all_*.zip")) or sorted(STATIC_DIR.glob("subway_all*.zip"))
