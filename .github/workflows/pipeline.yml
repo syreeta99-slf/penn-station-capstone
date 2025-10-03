@@ -8,13 +8,19 @@ on:
     - cron: "*/10 0-1 * * 1-5"     # PM 20:00–21:59 ET
     # Weekly static refresh (Sun 03:10 UTC)
     - cron: "10 3 * * 0"
-  workflow_dispatch: {}  # allow manual run
+  workflow_dispatch:
+    inputs:
+      run_static_refresh:
+        description: "Run GTFS static refresh now?"
+        type: boolean
+        default: false
 
 jobs:
   pipeline:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -24,24 +30,28 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
-      # Refresh static GTFS weekly
-      - name: Refresh GTFS static (weekly)
-        if: github.event.schedule == '10 3 * * 0'
+      # Refresh GTFS static weekly (cron) OR when manually requested via the checkbox
+      - name: Refresh GTFS static (weekly or manual)
+        if: >
+          (github.event_name == 'schedule' && github.event.schedule == '10 3 * * 0') ||
+          (github.event_name == 'workflow_dispatch' && inputs.run_static_refresh == true)
         run: python pollers/mta_static_refresh.py
 
-      # Pull realtime (protobuf) every scheduled run
+      # Pull realtime (protobuf) every scheduled run (and manual runs)
       - name: Poll MTA Subway realtime
         run: python pollers/mta_realtime_subway.py
 
-      # Build curated master
+      # Build curated master (uses latest static ZIP + realtime)
       - name: Build Master dataset
         run: python pollers/build_master.py
 
-      # Make sure the curated folder exists (first run may be empty)
+      # --- Upload to Google Drive via rclone ---
+
+      # Ensure curated folder exists (first run may be empty)
       - name: Ensure curated folder exists
         run: mkdir -p data/curated
 
-      # Install rclone on the GitHub runner
+      # Install rclone on the runner
       - name: Install rclone
         run: curl -fsSL https://rclone.org/install.sh | sudo bash
 
@@ -53,14 +63,13 @@ jobs:
           chmod 600 ~/.config/rclone/rclone.conf
 
       # Sanity check: confirm the remote exists and is reachable
-      # Replace 'googledrive' below if your remote name is different
+      # Replace 'googledrive' if your remote name differs
       - name: Verify rclone remote
         run: |
           rclone listremotes
           rclone lsd googledrive: || (echo "Remote 'googledrive' not found; check your remote name and secret" && exit 1)
 
       # Copy curated outputs to Google Drive (My Drive/penn-station/curated)
-      # Change the destination path as you like
       - name: Upload curated dataset to Google Drive
         run: |
           if [ -z "$(ls -A data/curated || true)" ]; then
@@ -70,7 +79,7 @@ jobs:
               --create-empty-src-dirs --checksum --transfers=4 --checkers=8
           fi
 
-      # (Optional) Also save the curated files as a workflow artifact for easy download
+      # Optional: also save curated files as a workflow artifact
       - name: Upload curated artifacts
         uses: actions/upload-artifact@v4
         with:
