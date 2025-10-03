@@ -151,9 +151,12 @@ def join_static_with_rt(sched_df: pd.DataFrame, rt_df: pd.DataFrame) -> pd.DataF
 def build_interfaces_123_ace(events_df: pd.DataFrame) -> pd.DataFrame:
     """
     Build interface events: for each arrival on one node, find the next departure
-    on the *other* node within TRANSFER_WINDOW_MIN. Produces one row per
-    transfer opportunity (Subway_123 ↔ Subway_ACE).
+    on the *other* node within TRANSFER_WINDOW_MIN. Prefer RT times; fall back to Scheduled
+    so we still produce rows when RT is missing. Adds Used_Scheduled_Fallback flag.
     """
+    if events_df.empty:
+        return pd.DataFrame()
+
     df = events_df.copy()
     df["From_Node"] = df["route_id"].apply(route_to_node)
 
@@ -164,8 +167,13 @@ def build_interfaces_123_ace(events_df: pd.DataFrame) -> pd.DataFrame:
 
     df["Target_Node"] = df["From_Node"].apply(other)
 
-    arrivals   = df[df["RT_Arrival"].notna()].copy()
-    departures = df[df["RT_Departure"].notna()].copy()
+    # Build 'best available' arrival/departure timestamps
+    df["Best_Arrival"]   = df["RT_Arrival"].combine_first(df["Scheduled_Arrival"])
+    df["Best_Departure"] = df["RT_Departure"].combine_first(df["Scheduled_Departure"])
+    df["Used_Scheduled_Fallback"] = df["RT_Arrival"].isna() | df["RT_Departure"].isna()
+
+    arrivals   = df[df["Best_Arrival"].notna()].copy()
+    departures = df[df["Best_Departure"].notna()].copy()
     departures["To_Node"] = departures["route_id"].apply(route_to_node)
 
     out_rows = []
@@ -173,15 +181,15 @@ def build_interfaces_123_ace(events_df: pd.DataFrame) -> pd.DataFrame:
         tgt = a["Target_Node"]
         if not tgt:
             continue
+        # Find earliest departure on the other node after arrival within the window
         mask = (
             (departures["To_Node"] == tgt) &
-            (departures["RT_Departure"] >= a["RT_Arrival"]) &
-            (departures["RT_Departure"] <= a["RT_Arrival"] + pd.Timedelta(minutes=TRANSFER_WINDOW_MIN))
+            (departures["Best_Departure"] >= a["Best_Arrival"]) &
+            (departures["Best_Departure"] <= a["Best_Arrival"] + pd.Timedelta(minutes=TRANSFER_WINDOW_MIN))
         )
-        cand = departures.loc[mask].sort_values("RT_Departure").head(1)
+        cand = departures.loc[mask].sort_values("Best_Departure").head(1)
 
-        # Build a stable Interface_ID based on nodes + event minute
-        base_ts = a["RT_Arrival"] if pd.notna(a["RT_Arrival"]) else a["Scheduled_Arrival"]
+        base_ts = a["Best_Arrival"]
         iid = f"{a['From_Node']}_{tgt}_{pd.Timestamp(base_ts).tz_convert('UTC').strftime('%Y%m%d_%H%M')}"
 
         if cand.empty:
@@ -190,32 +198,36 @@ def build_interfaces_123_ace(events_df: pd.DataFrame) -> pd.DataFrame:
                 "From_Node": a["From_Node"],
                 "To_Node": tgt,
                 "Link_Type": "Subway-Subway",
-                "Scheduled_Arrival": a["Scheduled_Arrival"],
-                "RT_Arrival": a["RT_Arrival"],
-                "Arrival_Delay_Min": a["Arrival_Delay_Min"],
+                "Scheduled_Arrival": a.get("Scheduled_Arrival"),
+                "RT_Arrival": a.get("RT_Arrival"),
+                "Arrival_Delay_Min": a.get("Arrival_Delay_Min"),
                 "Scheduled_Departure": pd.NaT,
                 "RT_Departure": pd.NaT,
                 "Departure_Delay_Min": pd.NA,
                 "Transfer_Gap_Min": pd.NA,
-                "Missed_Transfer_Flag": True
+                "Missed_Transfer_Flag": True,
+                "Used_Scheduled_Fallback": bool(a["Used_Scheduled_Fallback"])
             })
             continue
 
         d = cand.iloc[0]
-        gap_min = (d["RT_Departure"] - a["RT_Arrival"]).total_seconds() / 60.0
+        # Gap from best-available times
+        gap_min = (pd.Timestamp(d["Best_Departure"]) - pd.Timestamp(a["Best_Arrival"])).total_seconds() / 60.0
+
         out_rows.append({
             "Interface_ID": iid,
             "From_Node": a["From_Node"],
             "To_Node": tgt,
             "Link_Type": "Subway-Subway",
-            "Scheduled_Arrival": a["Scheduled_Arrival"],
-            "RT_Arrival": a["RT_Arrival"],
-            "Arrival_Delay_Min": a["Arrival_Delay_Min"],
-            "Scheduled_Departure": d["Scheduled_Departure"],
-            "RT_Departure": d["RT_Departure"],
-            "Departure_Delay_Min": d["Departure_Delay_Min"],
+            "Scheduled_Arrival": a.get("Scheduled_Arrival"),
+            "RT_Arrival": a.get("RT_Arrival"),
+            "Arrival_Delay_Min": a.get("Arrival_Delay_Min"),
+            "Scheduled_Departure": d.get("Scheduled_Departure"),
+            "RT_Departure": d.get("RT_Departure"),
+            "Departure_Delay_Min": d.get("Departure_Delay_Min"),
             "Transfer_Gap_Min": gap_min,
-            "Missed_Transfer_Flag": (gap_min < MISSED_THRESHOLD_MIN)
+            "Missed_Transfer_Flag": (gap_min < MISSED_THRESHOLD_MIN),
+            "Used_Scheduled_Fallback": bool(a["Used_Scheduled_Fallback"] or d["Used_Scheduled_Fallback"])
         })
 
     return pd.DataFrame(out_rows)
@@ -240,20 +252,26 @@ def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def add_placeholders_and_scores(df: pd.DataFrame) -> pd.DataFrame:
-    df["Avg_Flow_Volume"] = pd.NA
-    df["Peak_Flow_Volume"] = pd.NA
-    df["Daily_Ridership_Share_%"] = pd.NA
-    df["Delay_Frequency_%"] = pd.NA
-    df["Avg_Delay_Min"] = pd.NA
-    df["Delay_Chain_Min"] = (df["Arrival_Delay_Min"].fillna(0) + df["Departure_Delay_Min"].fillna(0))
-    df["Chain_Reaction_Factor"] = pd.NA
-    df["Alt_Path_Available"] = pd.NA
-    df["Criticality_Score"] = pd.NA
-    df["Ped_Count"] = pd.NA
-    df["Stress_Index"] = pd.NA
-    df["External_Pressure"] = pd.NA
-    df["Incident_History"] = pd.NA
+    # Ensure these columns exist before using them
+    for col in ["Arrival_Delay_Min", "Departure_Delay_Min"]:
+        if col not in df.columns:
+            df[col] = pd.NA
+
+    # Derived fields / placeholders
+    df["Delay_Chain_Min"] = (
+        pd.to_numeric(df["Arrival_Delay_Min"], errors="coerce").fillna(0) +
+        pd.to_numeric(df["Departure_Delay_Min"], errors="coerce").fillna(0)
+    )
+    for col in [
+        "Avg_Flow_Volume","Peak_Flow_Volume","Daily_Ridership_Share_%",
+        "Delay_Frequency_%","Avg_Delay_Min","Chain_Reaction_Factor",
+        "Alt_Path_Available","Criticality_Score","Ped_Count","Stress_Index",
+        "External_Pressure","Incident_History"
+    ]:
+        if col not in df.columns:
+            df[col] = pd.NA
     return df
+
 
 # ----------------------- MAIN ------------------------
 def main():
@@ -273,6 +291,12 @@ def main():
     # Load scheduled rows at Penn (tz-aware UTC), then join + delays
     sched = load_scheduled_at_penn(service_date, penn_ids)
     events_at_penn = join_static_with_rt(sched, rt)
+
+    # Warn if RT didn't match much (helps diagnose stop_ids/trip_id mismatches)
+    n_total = len(events_at_penn)
+    n_rt_arr = events_at_penn["RT_Arrival"].notna().sum()
+    n_rt_dep = events_at_penn["RT_Departure"].notna().sum()
+    print(f"[build_master] rows at Penn: {n_total}, with RT_Arrival: {n_rt_arr}, RT_Departure: {n_rt_dep}")
 
     # Guardrail: ensure required columns exist
     required = [
