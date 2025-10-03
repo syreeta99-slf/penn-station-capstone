@@ -37,24 +37,46 @@ jobs:
       - name: Build Master dataset
         run: python pollers/build_master.py
 
-      # Upload curated snapshots to Google Drive
-      - name: Install rclone
-        run: curl -fsSL https://rclone.org/install.sh | sudo bash
+# Make sure the curated folder exists (first run may be empty)
+- name: Ensure curated folder exists
+  run: mkdir -p data/curated
 
-      - name: Write rclone.conf from Base64 secret
-        run: |
-          mkdir -p ~/.config/rclone
-          echo "${{ secrets.RCLONE_CONF_B64 }}" | base64 -d > ~/.config/rclone/rclone.conf
-          chmod 600 ~/.config/rclone/rclone.conf
+# Install rclone on the GitHub runner
+- name: Install rclone
+  run: curl -fsSL https://rclone.org/install.sh | sudo bash
 
-      - name: Copy to Google Drive
-        run: |
-          rclone copy data/curated googledrive:penn-station/curated \ --create-empty-src-dirs --checksum --transfers=4 --checkers=8
-          
-      # (Optional) Save run artifacts
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: curated_${{ github.run_id }}
-          path: data/curated/*
-          retention-days: 30
+# Decode your Base64 rclone.conf secret into the runner
+- name: Write rclone.conf from Base64 secret
+  run: |
+    mkdir -p ~/.config/rclone
+    echo "${{ secrets.RCLONE_CONF_B64 }}" | base64 -d > ~/.config/rclone/rclone.conf
+    chmod 600 ~/.config/rclone/rclone.conf
+
+# Sanity check: confirm the remote exists and is reachable
+# Replace 'googledrive' below if your remote name is different
+- name: Verify rclone remote
+  run: |
+    rclone listremotes
+    rclone lsd googledrive: || (echo "Remote 'googledrive' not found; check your remote name and secret" && exit 1)
+
+# Copy curated outputs to Google Drive (My Drive/penn-station/curated)
+# Change the destination path as you like
+- name: Upload curated dataset to Google Drive
+  run: |
+    if [ -z "$(ls -A data/curated || true)" ]; then
+      echo "Nothing to upload yet (data/curated is empty)."
+    else
+      rclone copy data/curated googledrive:penn-station/curated \
+        --create-empty-src-dirs --checksum --transfers=4 --checkers=8
+    fi
+
+# (Optional) Also save the curated files as a workflow artifact for easy download
+- name: Upload curated artifacts
+  uses: actions/upload-artifact@v4
+  with:
+    name: curated_${{ github.run_id }}
+    path: data/curated/*
+    retention-days: 30
+
+# --- END: Upload to Google Drive via rclone ---
+
