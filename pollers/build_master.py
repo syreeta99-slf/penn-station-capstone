@@ -379,12 +379,21 @@ def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
 
-    # first non-null among RT_Arrival, RT_Departure, Scheduled_Arrival, Scheduled_Departure
-    when = pd.to_datetime(
-        df[["RT_Arrival", "RT_Departure", "Scheduled_Arrival", "Scheduled_Departure"]],
-        utc=True, errors="coerce"
-    ).bfill(axis=1).iloc[:, 0]
+    # Build a 4-column candidate matrix, each coerced to tz-aware UTC datetimes
+    when_candidates = pd.concat(
+        [
+            pd.to_datetime(df.get("RT_Arrival"), utc=True, errors="coerce"),
+            pd.to_datetime(df.get("RT_Departure"), utc=True, errors="coerce"),
+            pd.to_datetime(df.get("Scheduled_Arrival"), utc=True, errors="coerce"),
+            pd.to_datetime(df.get("Scheduled_Departure"), utc=True, errors="coerce"),
+        ],
+        axis=1,
+    )
 
+    # Take the first non-null across the 4 columns
+    when = when_candidates.bfill(axis=1).iloc[:, 0]
+
+    # Convert to local time for feature extraction
     when_local = when.dt.tz_convert("America/New_York")
 
     df["Day_of_Week"] = when_local.dt.day_name()
@@ -397,7 +406,6 @@ def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
     )
     return df
 
-# ----------------------- MAIN ------------------------
 # ----------------------- MAIN ------------------------
 def main():
     if not CONFIG_PATH.exists():
