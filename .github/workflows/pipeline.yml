@@ -37,9 +37,20 @@ jobs:
           (github.event_name == 'workflow_dispatch' && inputs.run_static_refresh == true)
         run: python pollers/mta_static_refresh.py
 
-        # Optional: verify the static file exists
-      - name: List static ZIPs
-        run: ls -lh gtfs_static || true
+      # Ensure at least one static ZIP exists (auto-run refresh if missing)
+      - name: Ensure static GTFS exists
+        run: |
+          set -e
+          if ls gtfs_static/subway_all_*.zip 1> /dev/null 2>&1; then
+            echo "Static GTFS found:"
+            ls -lh gtfs_static/subway_all_*.zip | tail -n 3
+          else
+            echo "No static GTFS found. Running static refresh..."
+            python pollers/mta_static_refresh.py
+            echo "Downloaded static:"
+            ls -lh gtfs_static
+          fi
+
 
       # Pull realtime (protobuf) every scheduled run (and manual runs)
       - name: Poll MTA Subway realtime
