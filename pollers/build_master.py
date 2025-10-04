@@ -583,7 +583,7 @@ def main():
         print("\n[qc] Transfer_Gap_Min quantiles (10/25/50/75/90):")
         print(qs.to_string())
     else:
-    print("\n[qc] Transfer_Gap_Min: n=0")
+        print("\n[qc] Transfer_Gap_Min: n=0")
 
     # Negative vs positive delays (filled)
     for name in ["Arrival_Delay_Min_Filled", "Departure_Delay_Min_Filled"]:
