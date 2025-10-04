@@ -160,61 +160,119 @@ def load_scheduled_at_penn(service_date: str, penn_stop_ids: list) -> pd.DataFra
 def join_static_with_rt_time_based(sched_df: pd.DataFrame, rt_df: pd.DataFrame, tolerance_min: int = 30) -> pd.DataFrame:
     """
     Match RT events to static schedules by stop_id_norm + nearest time within tolerance (minutes).
-    Avoids fragile 'trip_id' equality.
+    Drops rows with null keys before merge_asof to avoid errors.
     """
     tol = pd.Timedelta(minutes=tolerance_min)
 
-    # Prepare frames for arrivals and departures
+    # Prepare RT frames (arrival / departure), keep only rows with non-null keys
     rtA = rt_df[["trip_id","stop_id","stop_id_norm","route_id","rt_arrival_utc"]].rename(
         columns={"rt_arrival_utc":"RT_Arrival"}).copy()
     rtD = rt_df[["trip_id","stop_id","stop_id_norm","route_id","rt_departure_utc"]].rename(
         columns={"rt_departure_utc":"RT_Departure"}).copy()
 
-    schedA = sched_df.sort_values(["stop_id_norm","Scheduled_Arrival"])
-    schedD = sched_df.sort_values(["stop_id_norm","Scheduled_Departure"])
-    rtA    = rtA.sort_values(["stop_id_norm","RT_Arrival"])
-    rtD    = rtD.sort_values(["stop_id_norm","RT_Departure"])
+    # Drop rows with NaT/NaN in merge keys
+    rtA = rtA.dropna(subset=["stop_id_norm", "RT_Arrival"]).copy()
+    rtD = rtD.dropna(subset=["stop_id_norm", "RT_Departure"]).copy()
 
-    # Asof match per normalized stop
-    matchedA = pd.merge_asof(
-        rtA, schedA,
-        left_on="RT_Arrival", right_on="Scheduled_Arrival",
-        by="stop_id_norm", direction="nearest", tolerance=tol,
-        suffixes=("_rt","_sched")
-    )
-    matchedD = pd.merge_asof(
-        rtD, schedD,
-        left_on="RT_Departure", right_on="Scheduled_Departure",
-        by="stop_id_norm", direction="nearest", tolerance=tol,
-        suffixes=("_rt","_sched")
-    )
+    # Prepare schedule frames & drop rows with null keys
+    schedA = sched_df.dropna(subset=["stop_id_norm", "Scheduled_Arrival"]).copy()
+    schedD = sched_df.dropna(subset=["stop_id_norm", "Scheduled_Departure"]).copy()
+
+    # If either side is empty, short-circuit to an empty result (avoid merge_asof errors)
+    def _empty_out():
+        return pd.DataFrame(columns=[
+            "trip_id","route_id","stop_id","stop_id_norm",
+            "Scheduled_Arrival","RT_Arrival","Arrival_Delay_Min",
+            "Scheduled_Departure","RT_Departure","Departure_Delay_Min"
+        ])
+
+    # Sort as required by merge_asof: first by 'by' key, then by 'on' key
+    if not rtA.empty:    rtA = rtA.sort_values(["stop_id_norm","RT_Arrival"])
+    if not rtD.empty:    rtD = rtD.sort_values(["stop_id_norm","RT_Departure"])
+    if not schedA.empty: schedA = schedA.sort_values(["stop_id_norm","Scheduled_Arrival"])
+    if not schedD.empty: schedD = schedD.sort_values(["stop_id_norm","Scheduled_Departure"])
+
+    # Merge arrivals
+    if rtA.empty or schedA.empty:
+        matchedA = pd.DataFrame(columns=[
+            "stop_id_norm","RT_Arrival","trip_id_sched","route_id","stop_id_sched","Scheduled_Arrival"
+        ])
+    else:
+        matchedA = pd.merge_asof(
+            rtA, schedA,
+            left_on="RT_Arrival", right_on="Scheduled_Arrival",
+            by="stop_id_norm", direction="nearest", tolerance=tol,
+            suffixes=("_rt","_sched")
+        )
+
+    # Merge departures
+    if rtD.empty or schedD.empty:
+        matchedD = pd.DataFrame(columns=[
+            "stop_id_norm","RT_Departure","trip_id_sched","route_id","stop_id_sched","Scheduled_Departure"
+        ])
+    else:
+        matchedD = pd.merge_asof(
+            rtD, schedD,
+            left_on="RT_Departure", right_on="Scheduled_Departure",
+            by="stop_id_norm", direction="nearest", tolerance=tol,
+            suffixes=("_rt","_sched")
+        )
+
+    # If both are empty, return an empty frame with the expected columns
+    if matchedA.empty and matchedD.empty:
+        return _empty_out()
 
     # Build union base keyed by stop_id_norm + available times
     base = pd.DataFrame({
-        "stop_id_norm": pd.concat([matchedA["stop_id_norm"], matchedD["stop_id_norm"]], ignore_index=True)
+        "stop_id_norm": pd.concat(
+            [matchedA.get("stop_id_norm", pd.Series(dtype=object)),
+             matchedD.get("stop_id_norm", pd.Series(dtype=object))],
+            ignore_index=True
+        )
     }).dropna().drop_duplicates()
 
-    out = base.merge(matchedA[[
-        "stop_id_norm","RT_Arrival","trip_id_sched","route_id","stop_id_sched","Scheduled_Arrival"
-    ]], on="stop_id_norm", how="left")
+    # Attach matched columns
+    useA_cols = [c for c in ["stop_id_norm","RT_Arrival","trip_id_sched","route_id","stop_id_sched","Scheduled_Arrival"] if c in matchedA.columns]
+    useD_cols = [c for c in ["stop_id_norm","RT_Departure","trip_id_sched","route_id","stop_id_sched","Scheduled_Departure"] if c in matchedD.columns]
 
-    out = out.merge(matchedD[[
-        "stop_id_norm","RT_Departure","trip_id_sched","route_id","stop_id_sched","Scheduled_Departure"
-    ]], on="stop_id_norm", how="left", suffixes=("_arr","_dep"))
+    out = base
+    if useA_cols:
+        out = out.merge(matchedA[useA_cols], on="stop_id_norm", how="left")
+    else:
+        for c in ["RT_Arrival","trip_id_sched","route_id","stop_id_sched","Scheduled_Arrival"]:
+            out[c] = pd.NA
 
-    # Unify columns
-    out = out.rename(columns={
-        "trip_id_sched_arr":"trip_id_arr","stop_id_sched_arr":"stop_id_arr","route_id_arr":"route_id_arr",
-        "trip_id_sched_dep":"trip_id_dep","stop_id_sched_dep":"stop_id_dep","route_id_dep":"route_id_dep",
-    })
+    if useD_cols:
+        out = out.merge(matchedD[useD_cols], on="stop_id_norm", how="left", suffixes=("_arr","_dep"))
+    else:
+        for c in ["RT_Departure","trip_id_sched_dep","route_id_dep","stop_id_sched_dep","Scheduled_Departure"]:
+            out[c] = pd.NA
 
+    # Unify columns (guard against missing)
+    rename_map = {}
+    if "trip_id_sched" in out.columns:           rename_map["trip_id_sched"] = "trip_id_arr"
+    if "stop_id_sched" in out.columns:           rename_map["stop_id_sched"] = "stop_id_arr"
+    if "route_id" in out.columns and "route_id_arr" not in out.columns:
+        # Arrival leg route_id column may be simply 'route_id' depending on merge outcome
+        rename_map["route_id"] = "route_id_arr"
+    if "trip_id_sched_dep" in out.columns:       rename_map["trip_id_sched_dep"] = "trip_id_dep"
+    if "stop_id_sched_dep" in out.columns:       rename_map["stop_id_sched_dep"] = "stop_id_dep"
+    out = out.rename(columns=rename_map)
+
+    # Ensure expected columns exist
+    for c in ["trip_id_arr","stop_id_arr","route_id_arr","trip_id_dep","stop_id_dep","route_id_dep",
+              "Scheduled_Arrival","RT_Arrival","Scheduled_Departure","RT_Departure"]:
+        if c not in out.columns:
+            out[c] = pd.NA
+
+    # Pick a single trip_id/stop_id/route_id to carry forward (arrival-preferred)
     out["trip_id"]  = out["trip_id_arr"].combine_first(out["trip_id_dep"])
     out["route_id"] = out["route_id_arr"].combine_first(out["route_id_dep"])
     out["stop_id"]  = out["stop_id_arr"].combine_first(out["stop_id_dep"])
 
     # Delays
-    out["Arrival_Delay_Min"]   = (out["RT_Arrival"]   - out["Scheduled_Arrival"]).dt.total_seconds() / 60.0
-    out["Departure_Delay_Min"] = (out["RT_Departure"] - out["Scheduled_Departure"]).dt.total_seconds() / 60.0
+    out["Arrival_Delay_Min"]   = (pd.to_datetime(out["RT_Arrival"], utc=True)   - pd.to_datetime(out["Scheduled_Arrival"], utc=True)).dt.total_seconds() / 60.0
+    out["Departure_Delay_Min"] = (pd.to_datetime(out["RT_Departure"], utc=True) - pd.to_datetime(out["Scheduled_Departure"], utc=True)).dt.total_seconds() / 60.0
 
     keep = [
         "trip_id","route_id","stop_id","stop_id_norm",
