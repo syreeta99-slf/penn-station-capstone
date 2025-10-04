@@ -443,8 +443,8 @@ def main():
       f"dep={rt['rt_departure_utc'].notna().sum()} "
       f"stop_norm_missing={(rt['stop_id_norm'].isna().sum() if 'stop_id_norm' in rt.columns else 'NA')}")
 
-# now run the join
-events_at_penn = join_static_with_rt_time_based(sched, rt, tolerance_min=30)
+    # now run the join
+    events_at_penn = join_static_with_rt_time_based(sched, rt, tolerance_min=30)
 
 
     # Diagnostics
