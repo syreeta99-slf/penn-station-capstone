@@ -442,6 +442,10 @@ def build_interfaces_123_ace(events_df: pd.DataFrame) -> pd.DataFrame:
             0.0
         )
 
+        # If dep delay is NA or 0 due to missing RT, propagate arrival delay as a proxy
+        if (pd.isna(dep_delay_filled) or dep_delay_filled == 0) and pd.notna(arr_delay_filled):
+            dep_delay_filled = float(arr_delay_filled)
+
 
         out_rows.append({
             "Interface_ID": iid,
