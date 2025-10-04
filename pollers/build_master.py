@@ -378,9 +378,14 @@ def build_interfaces_123_ace(events_df: pd.DataFrame) -> pd.DataFrame:
 def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
-    when = df["RT_Arrival"].combine_first(df["RT_Departure"]).combine_first(
-        df["Scheduled_Arrival"]).combine_first(df["Scheduled_Departure"])
-    when_local = pd.to_datetime(when, utc=True).dt.tz_convert("America/New_York")
+
+    # first non-null among RT_Arrival, RT_Departure, Scheduled_Arrival, Scheduled_Departure
+    when = pd.to_datetime(
+        df[["RT_Arrival", "RT_Departure", "Scheduled_Arrival", "Scheduled_Departure"]],
+        utc=True, errors="coerce"
+    ).bfill(axis=1).iloc[:, 0]
+
+    when_local = when.dt.tz_convert("America/New_York")
 
     df["Day_of_Week"] = when_local.dt.day_name()
     df["Hour_of_Day"] = when_local.dt.hour
@@ -392,25 +397,7 @@ def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
     )
     return df
 
-
-def add_placeholders_and_scores(df: pd.DataFrame) -> pd.DataFrame:
-    for col in ["Arrival_Delay_Min", "Departure_Delay_Min"]:
-        if col not in df.columns:
-            df[col] = pd.NA
-    df["Delay_Chain_Min"] = (
-        pd.to_numeric(df["Arrival_Delay_Min"], errors="coerce").fillna(0) +
-        pd.to_numeric(df["Departure_Delay_Min"], errors="coerce").fillna(0)
-    )
-    for col in [
-        "Avg_Flow_Volume","Peak_Flow_Volume","Daily_Ridership_Share_%",
-        "Delay_Frequency_%","Avg_Delay_Min","Chain_Reaction_Factor",
-        "Alt_Path_Available","Criticality_Score","Ped_Count","Stress_Index",
-        "External_Pressure","Incident_History"
-    ]:
-        if col not in df.columns:
-            df[col] = pd.NA
-    return df
-
+# ----------------------- MAIN ------------------------
 # ----------------------- MAIN ------------------------
 def main():
     if not CONFIG_PATH.exists():
@@ -420,12 +407,14 @@ def main():
     if not penn_ids:
         raise RuntimeError("'subway_penn_stops' is empty in config/penn_stops.json")
 
+    # Load inputs
     rt = load_realtime_events()
     service_date = infer_service_date_from_rt(rt)
     print(f"[build_master] Using service_date: {service_date}")
 
     sched = load_scheduled_at_penn(service_date, penn_ids)
 
+    # Filter static by RT time window (+/- 60min) to reduce noise
     rt_times = pd.concat([rt.get("rt_arrival_utc"), rt.get("rt_departure_utc")], ignore_index=True).dropna()
     if not rt_times.empty:
         rt_min, rt_max = rt_times.min(), rt_times.max()
@@ -440,23 +429,45 @@ def main():
     else:
         print("[build_master] No RT times found; skipping static time window filter.")
 
+    # Diagnostics for RT before merge
     print(f"[build_master] RT non-null counts: "
           f"arr={rt['rt_arrival_utc'].notna().sum()} "
           f"dep={rt['rt_departure_utc'].notna().sum()} "
           f"stop_norm_missing={(rt['stop_id_norm'].isna().sum() if 'stop_id_norm' in rt.columns else 'NA')}")
 
+    # Time-based join
     events_at_penn = join_static_with_rt_time_based(sched, rt, tolerance_min=30)
 
+    # ---------- A) Exact de-dup on events ----------
+    event_dedup_keys = [
+        "stop_id_norm", "trip_id", "route_id", "stop_id",
+        "Scheduled_Arrival", "RT_Arrival",
+        "Scheduled_Departure", "RT_Departure",
+    ]
+    before_evt = len(events_at_penn)
+    events_at_penn = events_at_penn.drop_duplicates(subset=event_dedup_keys, keep="first")
+    print(f"[build_master] De-dup events (exact): {before_evt} → {len(events_at_penn)}")
+
+    # ---------- B) Optional soft de-dup (rounded to minute) ----------
+    # Use this ONLY if you observe near-identical duplicates caused by timestamp jitter
+    # evt = events_at_penn.copy()
+    # for c in ["RT_Arrival", "RT_Departure", "Scheduled_Arrival", "Scheduled_Departure"]:
+    #     evt[c] = pd.to_datetime(evt[c], utc=True, errors="coerce").dt.floor("min")
+    # before_soft = len(evt)
+    # evt = evt.drop_duplicates(subset=event_dedup_keys, keep="first")
+    # print(f"[build_master] De-dup events (rounded to min): {before_soft} → {len(evt)}")
+    # events_at_penn = evt
+
+    # Post-join diagnostics
     total_sched = len(sched)
     rt_rows = len(rt)
-    evt = len(events_at_penn)
+    evt_rows = len(events_at_penn)
     with_rt_arr = events_at_penn["RT_Arrival"].notna().sum()
     with_rt_dep = events_at_penn["RT_Departure"].notna().sum()
-    print(f"[build_master] sched_rows={total_sched}  rt_rows={rt_rows}  time-matched={evt} "
+    print(f"[build_master] sched_rows={total_sched}  rt_rows={rt_rows}  time-matched={evt_rows} "
           f"with_RT_Arr={with_rt_arr} with_RT_Dep={with_rt_dep}")
 
-    events_at_penn.to_csv("data/curated/_debug_events_at_penn.csv", index=False)
-
+    # Debug preview & save joined events
     required = ["trip_id","stop_id","route_id","Scheduled_Arrival","Scheduled_Departure","RT_Arrival","RT_Departure"]
     missing = [c for c in required if c not in events_at_penn.columns]
     if missing:
@@ -464,11 +475,23 @@ def main():
 
     print("[build_master] Preview of merged columns:")
     print(events_at_penn[required].head(8))
+    events_at_penn.to_csv("data/curated/_debug_events_at_penn.csv", index=False)
 
+    # Build interfaces
     interfaces = build_interfaces_123_ace(events_at_penn)
     interfaces = add_time_features(interfaces)
     interfaces = add_placeholders_and_scores(interfaces)
 
+    # ---------- C) De-dup the interface rows ----------
+    before_if = len(interfaces)
+    interfaces = interfaces.drop_duplicates(subset=[
+        "Interface_ID", "From_Node", "To_Node",
+        "Scheduled_Arrival", "RT_Arrival",
+        "Scheduled_Departure", "RT_Departure",
+    ], keep="first")
+    print(f"[build_master] De-dup interfaces: {before_if} → {len(interfaces)}")
+
+    # Final event-level schema order
     cols = [
         "Interface_ID","From_Node","To_Node","Link_Type",
         "Scheduled_Arrival","RT_Arrival","Arrival_Delay_Min",
@@ -485,13 +508,14 @@ def main():
             interfaces[c] = pd.NA
     interfaces = interfaces[cols]
 
+    # Save outputs
     out_csv = CURATED_DIR / "master_interface_dataset.csv"
     out_parq = CURATED_DIR / "master_interface_dataset.parquet"
     interfaces.to_csv(out_csv, index=False)
     interfaces.to_parquet(out_parq, index=False)
-
     print(f"[build_master] Wrote {len(interfaces)} rows → {out_csv} / {out_parq}")
 
 
 if __name__ == "__main__":
     main()
+
