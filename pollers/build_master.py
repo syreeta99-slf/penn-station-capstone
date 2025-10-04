@@ -13,7 +13,7 @@ Outputs:
 
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-import io, json, zipfile
+import io, json, zipfile, glob
 import pandas as pd
 
 # ----------------------- PATHS -----------------------
@@ -59,7 +59,6 @@ def parse_gtfs_time_to_dt(hms: str, service_date: str) -> pd.Timestamp:
     except Exception:
         return pd.NaT
     extra_days, h = divmod(h, 24)
-  # tz-aware UTC base
     base = pd.Timestamp(service_date).tz_localize("UTC")
     return base + pd.Timedelta(days=extra_days, hours=h, minutes=m, seconds=s)
 
@@ -87,12 +86,25 @@ def infer_service_date_from_rt(rt_df: pd.DataFrame) -> str:
     ts_local = ts.dt.tz_convert("America/New_York")
     return ts_local.dt.date.min().isoformat()
 
+def build_stop_alias_map(stops_df: pd.DataFrame) -> dict:
+    """
+    Map child stop_id -> parent_station (fallback to itself).
+    Use to normalize both static and RT stop_ids before matching.
+    """
+    alias = {}
+    for _, r in stops_df.iterrows():
+        sid = str(r["stop_id"])
+        parent = r.get("parent_station")
+        parent = str(parent) if pd.notna(parent) else sid
+        alias[sid] = parent
+    return alias
+
 # ------------------- LOAD INPUTS ---------------------
 def load_realtime_events() -> pd.DataFrame:
     files = sorted(REALTIME_DIR.glob("subway_rt_*.csv"))
     if not files:
         raise FileNotFoundError("No realtime CSVs in data/realtime/. Run the realtime poller first.")
-    # Use several recent snapshots; dedupe by (trip_id, stop_id, source_minute_utc)
+    # widen window to improve matching
     dfs = [pd.read_csv(f) for f in files[-60:]]
     df = pd.concat(dfs, ignore_index=True)
 
@@ -101,9 +113,16 @@ def load_realtime_events() -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], utc=True, errors="coerce")
 
+    # Normalize RT stop ids using alias map from latest static
+    zpath = latest_static_zip()
+    stops = read_txt_from_zip(zpath, "stops.txt")
+    alias = build_stop_alias_map(stops)
+    df["stop_id_norm"] = df["stop_id"].astype(str).map(alias).fillna(df["stop_id"].astype(str))
+
+    # Deduplicate by (trip_id, normalized stop, minute bucket)
     df["dedupe_key"] = (
         df["trip_id"].astype(str) + "|" +
-        df["stop_id"].astype(str) + "|" +
+        df["stop_id_norm"].astype(str) + "|" +
         df["source_minute_utc"].astype(str)
     )
     df = df.drop_duplicates("dedupe_key", keep="last").drop(columns=["dedupe_key"])
@@ -112,40 +131,91 @@ def load_realtime_events() -> pd.DataFrame:
 def load_scheduled_at_penn(service_date: str, penn_stop_ids: list) -> pd.DataFrame:
     """
     Read latest static ZIP, return scheduled rows for Penn stop IDs only
-    with tz-aware UTC Scheduled_Arrival/Departure.
+    with tz-aware UTC Scheduled_Arrival/Departure, and normalized stop_id.
     """
     zpath = latest_static_zip()
     print(f"[build_master] Using static file: {zpath.name}")
 
     trips      = read_txt_from_zip(zpath, "trips.txt")
     stop_times = read_txt_from_zip(zpath, "stop_times.txt")
+    stops      = read_txt_from_zip(zpath, "stops.txt")
 
-    st = stop_times[stop_times["stop_id"].isin(set(penn_stop_ids))].copy()
+    alias = build_stop_alias_map(stops)
+    stop_times["stop_id_norm"] = stop_times["stop_id"].astype(str).map(alias).fillna(stop_times["stop_id"].astype(str))
+    penn_norm = {alias.get(str(s), str(s)) for s in penn_stop_ids}
+
+    st = stop_times[stop_times["stop_id_norm"].isin(penn_norm)].copy()
     st["Scheduled_Arrival"]   = st["arrival_time"].astype(str).apply(lambda x: parse_gtfs_time_to_dt(x, service_date))
     st["Scheduled_Departure"] = st["departure_time"].astype(str).apply(lambda x: parse_gtfs_time_to_dt(x, service_date))
     st = st.merge(trips[["trip_id", "route_id"]], on="trip_id", how="left")
-    return st[["trip_id", "stop_id", "route_id", "Scheduled_Arrival", "Scheduled_Departure"]]
+    return st[["trip_id", "stop_id", "stop_id_norm", "route_id", "Scheduled_Arrival", "Scheduled_Departure"]]
 
-# -------------------- JOIN & DELAYS ------------------
-def join_static_with_rt(sched_df: pd.DataFrame, rt_df: pd.DataFrame) -> pd.DataFrame:
-    rt2 = rt_df.rename(columns={
-        "rt_arrival_utc": "RT_Arrival",
-        "rt_departure_utc": "RT_Departure"
-    })[["trip_id", "stop_id", "route_id", "RT_Arrival", "RT_Departure"]]
+# -------------------- TIME-BASED MATCH ------------------
+def join_static_with_rt_time_based(sched_df: pd.DataFrame, rt_df: pd.DataFrame, tolerance_min: int = 30) -> pd.DataFrame:
+    """
+    Match RT events to static schedules by stop_id_norm + nearest time within tolerance (minutes).
+    Avoids fragile 'trip_id' equality.
+    """
+    tol = pd.Timedelta(minutes=tolerance_min)
 
-    # Use INNER join so we only keep rows that actually matched RT
-    df = sched_df.merge(rt2, on=["trip_id", "stop_id"], how="inner", suffixes=("_sched", "_rt"))
+    # Prepare frames for arrivals and departures
+    rtA = rt_df[["trip_id","stop_id","stop_id_norm","route_id","rt_arrival_utc"]].rename(
+        columns={"rt_arrival_utc":"RT_Arrival"}).copy()
+    rtD = rt_df[["trip_id","stop_id","stop_id_norm","route_id","rt_departure_utc"]].rename(
+        columns={"rt_departure_utc":"RT_Departure"}).copy()
 
-    # Coalesce route_id
-    if "route_id_rt" in df.columns or "route_id_sched" in df.columns:
-        df["route_id"] = df.get("route_id_rt").combine_first(df.get("route_id_sched"))
-        for c in ["route_id_rt", "route_id_sched"]:
-            if c in df.columns:
-                df.drop(columns=c, inplace=True)
+    schedA = sched_df.sort_values(["stop_id_norm","Scheduled_Arrival"])
+    schedD = sched_df.sort_values(["stop_id_norm","Scheduled_Departure"])
+    rtA    = rtA.sort_values(["stop_id_norm","RT_Arrival"])
+    rtD    = rtD.sort_values(["stop_id_norm","RT_Departure"])
 
-    df["Arrival_Delay_Min"]   = (df["RT_Arrival"]   - df["Scheduled_Arrival"]).dt.total_seconds()/60.0
-    df["Departure_Delay_Min"] = (df["RT_Departure"] - df["Scheduled_Departure"]).dt.total_seconds()/60.0
-    return df
+    # Asof match per normalized stop
+    matchedA = pd.merge_asof(
+        rtA, schedA,
+        left_on="RT_Arrival", right_on="Scheduled_Arrival",
+        by="stop_id_norm", direction="nearest", tolerance=tol,
+        suffixes=("_rt","_sched")
+    )
+    matchedD = pd.merge_asof(
+        rtD, schedD,
+        left_on="RT_Departure", right_on="Scheduled_Departure",
+        by="stop_id_norm", direction="nearest", tolerance=tol,
+        suffixes=("_rt","_sched")
+    )
+
+    # Build union base keyed by stop_id_norm + available times
+    base = pd.DataFrame({
+        "stop_id_norm": pd.concat([matchedA["stop_id_norm"], matchedD["stop_id_norm"]], ignore_index=True)
+    }).dropna().drop_duplicates()
+
+    out = base.merge(matchedA[[
+        "stop_id_norm","RT_Arrival","trip_id_sched","route_id","stop_id_sched","Scheduled_Arrival"
+    ]], on="stop_id_norm", how="left")
+
+    out = out.merge(matchedD[[
+        "stop_id_norm","RT_Departure","trip_id_sched","route_id","stop_id_sched","Scheduled_Departure"
+    ]], on="stop_id_norm", how="left", suffixes=("_arr","_dep"))
+
+    # Unify columns
+    out = out.rename(columns={
+        "trip_id_sched_arr":"trip_id_arr","stop_id_sched_arr":"stop_id_arr","route_id_arr":"route_id_arr",
+        "trip_id_sched_dep":"trip_id_dep","stop_id_sched_dep":"stop_id_dep","route_id_dep":"route_id_dep",
+    })
+
+    out["trip_id"]  = out["trip_id_arr"].combine_first(out["trip_id_dep"])
+    out["route_id"] = out["route_id_arr"].combine_first(out["route_id_dep"])
+    out["stop_id"]  = out["stop_id_arr"].combine_first(out["stop_id_dep"])
+
+    # Delays
+    out["Arrival_Delay_Min"]   = (out["RT_Arrival"]   - out["Scheduled_Arrival"]).dt.total_seconds() / 60.0
+    out["Departure_Delay_Min"] = (out["RT_Departure"] - out["Scheduled_Departure"]).dt.total_seconds() / 60.0
+
+    keep = [
+        "trip_id","route_id","stop_id","stop_id_norm",
+        "Scheduled_Arrival","RT_Arrival","Arrival_Delay_Min",
+        "Scheduled_Departure","RT_Departure","Departure_Delay_Min"
+    ]
+    return out[keep]
 
 # --------------- INTERFACE CONSTRUCTION --------------
 def build_interfaces_123_ace(events_df: pd.DataFrame) -> pd.DataFrame:
@@ -167,7 +237,7 @@ def build_interfaces_123_ace(events_df: pd.DataFrame) -> pd.DataFrame:
 
     df["Target_Node"] = df["From_Node"].apply(other)
 
-    # Build 'best available' arrival/departure timestamps
+    # Best available times
     df["Best_Arrival"]   = df["RT_Arrival"].combine_first(df["Scheduled_Arrival"])
     df["Best_Departure"] = df["RT_Departure"].combine_first(df["Scheduled_Departure"])
     df["Used_Scheduled_Fallback"] = df["RT_Arrival"].isna() | df["RT_Departure"].isna()
@@ -181,7 +251,6 @@ def build_interfaces_123_ace(events_df: pd.DataFrame) -> pd.DataFrame:
         tgt = a["Target_Node"]
         if not tgt:
             continue
-        # Find earliest departure on the other node after arrival within the window
         mask = (
             (departures["To_Node"] == tgt) &
             (departures["Best_Departure"] >= a["Best_Arrival"]) &
@@ -211,7 +280,6 @@ def build_interfaces_123_ace(events_df: pd.DataFrame) -> pd.DataFrame:
             continue
 
         d = cand.iloc[0]
-        # Gap from best-available times
         gap_min = (pd.Timestamp(d["Best_Departure"]) - pd.Timestamp(a["Best_Arrival"])).total_seconds() / 60.0
 
         out_rows.append({
@@ -227,7 +295,7 @@ def build_interfaces_123_ace(events_df: pd.DataFrame) -> pd.DataFrame:
             "Departure_Delay_Min": d.get("Departure_Delay_Min"),
             "Transfer_Gap_Min": gap_min,
             "Missed_Transfer_Flag": (gap_min < MISSED_THRESHOLD_MIN),
-            "Used_Scheduled_Fallback": bool(a["Used_Scheduled_Fallback"] or d["Used_Scheduled_Fallback"])
+            "Used_Scheduled_Fallback": bool(a["Used_Scheduled_Fallback"])
         })
 
     return pd.DataFrame(out_rows)
@@ -236,7 +304,6 @@ def build_interfaces_123_ace(events_df: pd.DataFrame) -> pd.DataFrame:
 def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
-    # Choose event time (for bucketing)
     when = df["RT_Arrival"].combine_first(df["RT_Departure"]).combine_first(
         df["Scheduled_Arrival"]).combine_first(df["Scheduled_Departure"])
     when_local = pd.to_datetime(when, utc=True).dt.tz_convert("America/New_York")
@@ -252,12 +319,9 @@ def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def add_placeholders_and_scores(df: pd.DataFrame) -> pd.DataFrame:
-    # Ensure these columns exist before using them
     for col in ["Arrival_Delay_Min", "Departure_Delay_Min"]:
         if col not in df.columns:
             df[col] = pd.NA
-
-    # Derived fields / placeholders
     df["Delay_Chain_Min"] = (
         pd.to_numeric(df["Arrival_Delay_Min"], errors="coerce").fillna(0) +
         pd.to_numeric(df["Departure_Delay_Min"], errors="coerce").fillna(0)
@@ -271,7 +335,6 @@ def add_placeholders_and_scores(df: pd.DataFrame) -> pd.DataFrame:
         if col not in df.columns:
             df[col] = pd.NA
     return df
-
 
 # ----------------------- MAIN ------------------------
 def main():
@@ -288,31 +351,16 @@ def main():
     service_date = infer_service_date_from_rt(rt)
     print(f"[build_master] Using service_date: {service_date}")
 
-    # Load scheduled rows at Penn (tz-aware UTC), then join + delays
+    # Load scheduled rows at Penn (tz-aware UTC)
     sched = load_scheduled_at_penn(service_date, penn_ids)
-    events_at_penn = join_static_with_rt(sched, rt)
 
-    total_sched = len(sched)
-    rt_rows = len(rt)
-    evt = len(events_at_penn)
-    with_rt_arr = events_at_penn["RT_Arrival"].notna().sum()
-    with_rt_dep = events_at_penn["RT_Departure"].notna().sum()
-    print(f"[build_master] sched_rows={total_sched}  rt_rows={rt_rows}  joined={evt} "
-      f"with_RT_Arr={with_rt_arr} with_RT_Dep={with_rt_dep}")
-
-    # (Optional) save a debug copy so you can download it as an artifact
-    events_at_penn.to_csv("data/curated/_debug_events_at_penn.csv", index=False)
-
-    
-    # Compute RT time window
+    # Filter static to RT time window (+/- 60 min) to reduce noise
     rt_times = pd.concat([rt.get("rt_arrival_utc"), rt.get("rt_departure_utc")], ignore_index=True).dropna()
     if not rt_times.empty:
         rt_min = rt_times.min()
         rt_max = rt_times.max()
         pad = pd.Timedelta(minutes=60)
         rt_min, rt_max = rt_min - pad, rt_max + pad
-
-        # Keep static rows that fall within (rt_min, rt_max) on either arr or dep
         before = len(sched)
         sched = sched[
             sched["Scheduled_Arrival"].between(rt_min, rt_max) |
@@ -322,13 +370,22 @@ def main():
     else:
         print("[build_master] No RT times found; skipping static time window filter.")
 
-    # Warn if RT didn't match much (helps diagnose stop_ids/trip_id mismatches)
-    n_total = len(events_at_penn)
-    n_rt_arr = events_at_penn["RT_Arrival"].notna().sum()
-    n_rt_dep = events_at_penn["RT_Departure"].notna().sum()
-    print(f"[build_master] rows at Penn: {n_total}, with RT_Arrival: {n_rt_arr}, RT_Departure: {n_rt_dep}")
+    # Time-based match (stop_id_norm + nearest time)
+    events_at_penn = join_static_with_rt_time_based(sched, rt, tolerance_min=30)
 
-    # Guardrail: ensure required columns exist
+    # Diagnostics
+    total_sched = len(sched)
+    rt_rows = len(rt)
+    evt = len(events_at_penn)
+    with_rt_arr = events_at_penn["RT_Arrival"].notna().sum()
+    with_rt_dep = events_at_penn["RT_Departure"].notna().sum()
+    print(f"[build_master] sched_rows={total_sched}  rt_rows={rt_rows}  time-matched={evt} "
+          f"with_RT_Arr={with_rt_arr} with_RT_Dep={with_rt_dep}")
+
+    # Save joined events (debug)
+    events_at_penn.to_csv("data/curated/_debug_events_at_penn.csv", index=False)
+
+    # Guardrail
     required = [
         "trip_id", "stop_id", "route_id",
         "Scheduled_Arrival", "Scheduled_Departure",
@@ -338,7 +395,6 @@ def main():
     if missing:
         raise RuntimeError(f"Missing columns after join: {missing}. Got: {list(events_at_penn.columns)}")
 
-    # Debug preview to logs
     print("[build_master] Preview of merged columns:")
     print(events_at_penn[required].head(8))
 
