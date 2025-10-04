@@ -406,6 +406,52 @@ def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
     )
     return df
 
+def add_placeholders_and_scores(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure downstream score/placeholder fields exist and compute a simple delay-chain metric.
+    Safe to call on empty or partially-populated frames.
+    """
+    if df.empty:
+        # still ensure the columns exist for downstream schema selection
+        cols_to_init = [
+            "Arrival_Delay_Min", "Departure_Delay_Min",
+            "Delay_Chain_Min", "Avg_Flow_Volume", "Peak_Flow_Volume",
+            "Daily_Ridership_Share_%", "Delay_Frequency_%",
+            "Avg_Delay_Min", "Chain_Reaction_Factor", "Alt_Path_Available",
+            "Criticality_Score", "Ped_Count", "Stress_Index",
+            "External_Pressure", "Incident_History",
+        ]
+        for c in cols_to_init:
+            if c not in df.columns:
+                df[c] = pd.NA
+        return df
+
+    # Ensure delay cols exist
+    for col in ["Arrival_Delay_Min", "Departure_Delay_Min"]:
+        if col not in df.columns:
+            df[col] = pd.NA
+
+    # Simple chain metric (can refine later)
+    df["Delay_Chain_Min"] = (
+        pd.to_numeric(df["Arrival_Delay_Min"], errors="coerce").fillna(0)
+        + pd.to_numeric(df["Departure_Delay_Min"], errors="coerce").fillna(0)
+    )
+
+    # Ensure placeholders exist
+    for col in [
+        "Avg_Flow_Volume","Peak_Flow_Volume","Daily_Ridership_Share_%",
+        "Delay_Frequency_%","Avg_Delay_Min","Chain_Reaction_Factor",
+        "Alt_Path_Available","Criticality_Score","Ped_Count","Stress_Index",
+        "External_Pressure","Incident_History"
+    ]:
+        if col not in df.columns:
+            df[col] = pd.NA
+
+    return df
+
+
+
+
 # ----------------------- MAIN ------------------------
 def main():
     if not CONFIG_PATH.exists():
