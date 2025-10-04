@@ -61,8 +61,15 @@ jobs:
 
          # Build curated master (uses latest static ZIP + realtime)
       - name: Build Master dataset
-        run: python pollers/build_master.py   
-        
+        run: python pollers/build_master.py  
+
+      - name: Upload debug joined events (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug_events_at_penn
+          path: data/curated/_debug_events_at_penn.csv
+          retention-days: 5
+          
         # Upload the realtime CSVs so you can download them after the run
       - name: Upload realtime CSV artifact
         uses: actions/upload-artifact@v4
