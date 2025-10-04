@@ -141,29 +141,53 @@ def load_scheduled_at_penn(service_date: str, penn_stop_ids: list) -> pd.DataFra
 def join_static_with_rt_time_based(sched_df: pd.DataFrame, rt_df: pd.DataFrame, tolerance_min: int = 30) -> pd.DataFrame:
     """
     Match RT events to static schedules by stop_id_norm + nearest time within tolerance (minutes).
-    Ensures global sort by the 'on' key for merge_asof and consistent dtypes. Returns a consistent schema.
+    Uses pre-renamed columns (no suffix guessing), enforces global sort by 'on' keys, and returns a stable schema.
     """
     tol = pd.Timedelta(minutes=tolerance_min)
 
-    # Prepare RT frames (arrival / departure)
+    # ---- Build RT frames and pre-rename to unique names ----
     rtA = rt_df[["trip_id", "stop_id", "stop_id_norm", "route_id", "rt_arrival_utc"]].rename(
-        columns={"rt_arrival_utc": "RT_Arrival"}
-    ).copy()
-    rtD = rt_df[["trip_id", "stop_id", "stop_id_norm", "route_id", "rt_departure_utc"]].rename(
-        columns={"rt_departure_utc": "RT_Departure"}
+        columns={
+            "trip_id": "trip_id_arr",
+            "stop_id": "stop_id_arr",
+            "route_id": "route_id_arr",
+            "rt_arrival_utc": "RT_Arrival",
+        }
     ).copy()
 
-    # Drop rows with null merge keys
+    rtD = rt_df[["trip_id", "stop_id", "stop_id_norm", "route_id", "rt_departure_utc"]].rename(
+        columns={
+            "trip_id": "trip_id_dep",
+            "stop_id": "stop_id_dep",
+            "route_id": "route_id_dep",
+            "rt_departure_utc": "RT_Departure",
+        }
+    ).copy()
+
+    # ---- Build schedule frames and pre-rename to unique names ----
+    schedA = sched_df[["trip_id", "stop_id", "stop_id_norm", "route_id", "Scheduled_Arrival"]].rename(
+        columns={
+            "trip_id": "trip_id_sched_arr",
+            "stop_id": "stop_id_sched_arr",
+            "route_id": "route_id_sched_arr",
+        }
+    ).copy()
+
+    schedD = sched_df[["trip_id", "stop_id", "stop_id_norm", "route_id", "Scheduled_Departure"]].rename(
+        columns={
+            "trip_id": "trip_id_sched_dep",
+            "stop_id": "stop_id_sched_dep",
+            "route_id": "route_id_sched_dep",
+        }
+    ).copy()
+
+    # ---- Drop rows with null merge keys ----
     rtA = rtA.dropna(subset=["stop_id_norm", "RT_Arrival"]).copy()
     rtD = rtD.dropna(subset=["stop_id_norm", "RT_Departure"]).copy()
-    schedA = sched_df[["trip_id", "stop_id", "stop_id_norm", "route_id", "Scheduled_Arrival"]].dropna(
-        subset=["stop_id_norm", "Scheduled_Arrival"]
-    ).copy()
-    schedD = sched_df[["trip_id", "stop_id", "stop_id_norm", "route_id", "Scheduled_Departure"]].dropna(
-        subset=["stop_id_norm", "Scheduled_Departure"]
-    ).copy()
+    schedA = schedA.dropna(subset=["stop_id_norm", "Scheduled_Arrival"]).copy()
+    schedD = schedD.dropna(subset=["stop_id_norm", "Scheduled_Departure"]).copy()
 
-    # Align dtypes: time cols tz-aware UTC, by-key as str
+    # ---- Align dtypes: time cols tz-aware UTC, by-key as str ----
     if not rtA.empty:
         rtA["RT_Arrival"] = pd.to_datetime(rtA["RT_Arrival"], utc=True, errors="coerce")
     if not rtD.empty:
@@ -184,7 +208,7 @@ def join_static_with_rt_time_based(sched_df: pd.DataFrame, rt_df: pd.DataFrame, 
             "Scheduled_Departure", "RT_Departure", "Departure_Delay_Min"
         ])
 
-    # >>> IMPORTANT: sort by the 'on' key ONLY (global monotonic), not by ['by','on']
+    # ---- IMPORTANT: sort by the 'on' key ONLY (global monotonic), stable, reset index ----
     if not rtA.empty:
         rtA = rtA.sort_values("RT_Arrival", kind="mergesort").reset_index(drop=True)
     if not rtD.empty:
@@ -194,76 +218,41 @@ def join_static_with_rt_time_based(sched_df: pd.DataFrame, rt_df: pd.DataFrame, 
     if not schedD.empty:
         schedD = schedD.sort_values("Scheduled_Departure", kind="mergesort").reset_index(drop=True)
 
-    # Optional: assert global monotonic on 'on' keys (helps debug if anything still off)
-    for name, df_, oncol in [
-        ("rtA", rtA, "RT_Arrival"),
-        ("schedA", schedA, "Scheduled_Arrival"),
-        ("rtD", rtD, "RT_Departure"),
-        ("schedD", schedD, "Scheduled_Departure"),
-    ]:
-        if not df_.empty and not df_[oncol].is_monotonic_increasing:
-            print(f"[build_master] WARN: {name}.{oncol} not globally sorted; size={len(df_)}")
-
-    # Merge arrivals
+    # ---- Merge arrivals (no suffixes needed since we pre-renamed) ----
     if rtA.empty or schedA.empty:
         matchedA = pd.DataFrame(columns=[
             "stop_id_norm", "RT_Arrival",
             "trip_id_arr", "stop_id_arr", "route_id_arr",
             "trip_id_sched_arr", "stop_id_sched_arr", "route_id_sched_arr",
-            "Scheduled_Arrival"
+            "Scheduled_Arrival",
         ])
     else:
-        a = pd.merge_asof(
+        matchedA = pd.merge_asof(
             rtA, schedA,
             left_on="RT_Arrival", right_on="Scheduled_Arrival",
             by="stop_id_norm", direction="nearest", tolerance=tol,
-            suffixes=("_rt", "_sched"),
         )
-        matchedA = a[[
-            "stop_id_norm", "RT_Arrival",
-            "trip_id_rt", "stop_id_rt", "route_id_rt",
-            "trip_id", "stop_id", "route_id", "Scheduled_Arrival"
-        ]].rename(columns={
-            "trip_id_rt": "trip_id_arr",
-            "stop_id_rt": "stop_id_arr",
-            "route_id_rt": "route_id_arr",
-            "trip_id": "trip_id_sched_arr",
-            "stop_id": "stop_id_sched_arr",
-            "route_id": "route_id_sched_arr",
-        })
 
-    # Merge departures
+    # ---- Merge departures ----
     if rtD.empty or schedD.empty:
         matchedD = pd.DataFrame(columns=[
             "stop_id_norm", "RT_Departure",
             "trip_id_dep", "stop_id_dep", "route_id_dep",
             "trip_id_sched_dep", "stop_id_sched_dep", "route_id_sched_dep",
-            "Scheduled_Departure"
+            "Scheduled_Departure",
         ])
     else:
-        d = pd.merge_asof(
+        matchedD = pd.merge_asof(
             rtD, schedD,
             left_on="RT_Departure", right_on="Scheduled_Departure",
             by="stop_id_norm", direction="nearest", tolerance=tol,
-            suffixes=("_rt", "_sched"),
         )
-        matchedD = d[[
-            "stop_id_norm", "RT_Departure",
-            "trip_id_rt", "stop_id_rt", "route_id_rt",
-            "trip_id", "stop_id", "route_id", "Scheduled_Departure"
-        ]].rename(columns={
-            "trip_id_rt": "trip_id_dep",
-            "stop_id_rt": "stop_id_dep",
-            "route_id_rt": "route_id_dep",
-            "trip_id": "trip_id_sched_dep",
-            "stop_id": "stop_id_sched_dep",
-            "route_id": "route_id_sched_dep",
-        })
 
+    # ---- If both are empty, return a typed empty result ----
     if matchedA.empty and matchedD.empty:
         return _empty_out()
 
-    # Union base and join
+    # ---- Build union base keyed by stop_id_norm ----
     base = pd.DataFrame({
         "stop_id_norm": pd.concat(
             [
@@ -274,21 +263,22 @@ def join_static_with_rt_time_based(sched_df: pd.DataFrame, rt_df: pd.DataFrame, 
         )
     }).dropna().drop_duplicates()
 
+    # ---- Join matched pieces (pre-renamed columns so no suffix games) ----
     out = base.merge(matchedA, on="stop_id_norm", how="left")
     out = out.merge(matchedD, on="stop_id_norm", how="left", suffixes=("_arr", "_dep"))
 
-    # Ensure expected columns
+    # ---- Ensure expected columns exist ----
     for c in ["trip_id_arr", "stop_id_arr", "route_id_arr", "trip_id_dep", "stop_id_dep", "route_id_dep",
               "Scheduled_Arrival", "RT_Arrival", "Scheduled_Departure", "RT_Departure"]:
         if c not in out.columns:
             out[c] = pd.NA
 
-    # Choose single identifiers (arrival-preferred)
+    # ---- Choose a single trip_id/stop_id/route_id to carry forward (arrival-preferred) ----
     out["trip_id"]  = out["trip_id_arr"].combine_first(out["trip_id_dep"])
     out["route_id"] = out["route_id_arr"].combine_first(out["route_id_dep"])
     out["stop_id"]  = out["stop_id_arr"].combine_first(out["stop_id_dep"])
 
-    # Delays
+    # ---- Compute delays safely (handles NaT) ----
     out["Arrival_Delay_Min"] = (
         pd.to_datetime(out["RT_Arrival"], utc=True) - pd.to_datetime(out["Scheduled_Arrival"], utc=True)
     ).dt.total_seconds() / 60.0
@@ -296,6 +286,7 @@ def join_static_with_rt_time_based(sched_df: pd.DataFrame, rt_df: pd.DataFrame, 
         pd.to_datetime(out["RT_Departure"], utc=True) - pd.to_datetime(out["Scheduled_Departure"], utc=True)
     ).dt.total_seconds() / 60.0
 
+    # ---- Final schema ----
     keep = [
         "trip_id", "route_id", "stop_id", "stop_id_norm",
         "Scheduled_Arrival", "RT_Arrival", "Arrival_Delay_Min",
