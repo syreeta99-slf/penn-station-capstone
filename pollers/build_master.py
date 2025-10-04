@@ -343,17 +343,17 @@ def build_interfaces_123_ace(events_df: pd.DataFrame) -> pd.DataFrame:
         if not tgt:
             continue
     # Only pair if departure is same local day as arrival (NY time) and within window
-    arr_local_day = pd.Timestamp(a["Best_Arrival"]).tz_convert("America/New_York").date()
+        arr_local_day = pd.Timestamp(a["Best_Arrival"]).tz_convert("America/New_York").date()
 
-    dep_local = departures["Best_Departure"].dt.tz_convert("America/New_York")
-    same_day = dep_local.dt.date == arr_local_day
+        dep_local = departures["Best_Departure"].dt.tz_convert("America/New_York")
+        same_day = dep_local.dt.date == arr_local_day
 
-    mask = (
-        (departures["To_Node"] == tgt) &
-        same_day &
-        (departures["Best_Departure"] >= a["Best_Arrival"]) &
-        (departures["Best_Departure"] <= a["Best_Arrival"] + pd.Timedelta(minutes=TRANSFER_WINDOW_MIN))
-    )
+        mask = (
+            (departures["To_Node"] == tgt) &
+            same_day &
+            (departures["Best_Departure"] >= a["Best_Arrival"]) &
+            (departures["Best_Departure"] <= a["Best_Arrival"] + pd.Timedelta(minutes=TRANSFER_WINDOW_MIN))
+        )
 
         cand = departures.loc[mask].sort_values("Best_Departure").head(1)
 
