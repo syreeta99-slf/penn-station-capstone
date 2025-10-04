@@ -15,6 +15,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import io, json, zipfile, glob
 import pandas as pd
+import subprocess, sys
 
 # ----------------------- PATHS -----------------------
 DATA_DIR     = Path("data")
@@ -65,7 +66,12 @@ def parse_gtfs_time_to_dt(hms: str, service_date: str) -> pd.Timestamp:
 def latest_static_zip() -> Path:
     zips = sorted(STATIC_DIR.glob("subway_all_*.zip")) or sorted(STATIC_DIR.glob("subway_all*.zip"))
     if not zips:
-        raise FileNotFoundError("No subway static ZIPs in gtfs_static/. Run the static refresh step.")
+        print("[build_master] No static ZIPs found in gtfs_static/. Attempting one-time refresh...")
+        # run the refresher; let it raise if it fails
+        subprocess.check_call([sys.executable, "pollers/mta_static_refresh.py"])
+        zips = sorted(STATIC_DIR.glob("subway_all_*.zip")) or sorted(STATIC_DIR.glob("subway_all*.zip"))
+        if not zips:
+            raise FileNotFoundError("Static refresh ran but no subway_all_*.zip present in gtfs_static/.")
     return zips[-1]
 
 def read_txt_from_zip(zip_path: Path, member: str) -> pd.DataFrame:
