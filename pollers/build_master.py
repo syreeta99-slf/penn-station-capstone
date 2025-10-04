@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 import io, json, zipfile
 import pandas as pd
 import subprocess, sys
+import os
 
 # ----------------------- PATHS -----------------------
 DATA_DIR = Path("data")
@@ -28,8 +29,8 @@ CURATED_DIR.mkdir(parents=True, exist_ok=True)
 
 # -------------------- PARAMETERS ---------------------
 # Interface pairing thresholds
-TRANSFER_WINDOW_MIN = 20       # arrivals → next departure must be within this window
-MISSED_THRESHOLD_MIN = 2       # < 2 min gap (or no departure) ⇒ missed/unsafe
+TRANSFER_WINDOW_MIN = int(os.getenv("TRANSFER_WINDOW_MIN", "20"))
+MISSED_THRESHOLD_MIN = int(os.getenv("MISSED_THRESHOLD_MIN", "2"))
 
 # Peak periods (local hours)
 AM_PEAK = range(6, 10)         # 06–09
@@ -680,12 +681,26 @@ def main():
             interfaces[c] = pd.NA
     interfaces = interfaces[cols]
 
-    # Save outputs
+    #Save outputs
     out_csv = CURATED_DIR / "master_interface_dataset.csv"
     out_parq = CURATED_DIR / "master_interface_dataset.parquet"
     interfaces.to_csv(out_csv, index=False)
     interfaces.to_parquet(out_parq, index=False)
     print(f"[build_master] Wrote {len(interfaces)} rows → {out_csv} / {out_parq}")
+
+    # Save a lightweight JSON summary for quick reference
+    summary = {
+        "service_date": str(service_date),
+        "sched_rows": int(len(sched)),
+        "rt_rows": int(len(rt)),
+        "events_rows": int(len(events_at_penn)),
+        "interfaces_rows": int(len(interfaces)),
+        "missed_rate": float((interfaces["Missed_Transfer_Flag"] == True).mean()),
+        "transfer_window_min": TRANSFER_WINDOW_MIN,
+        "missed_threshold_min": MISSED_THRESHOLD_MIN,
+    }
+    pd.Series(summary).to_json(CURATED_DIR / "master_interface_dataset_summary.json", indent=2)
+    print(f"[build_master] Wrote run summary → {CURATED_DIR/'master_interface_dataset_summary.json'}")
 
 
 if __name__ == "__main__":
