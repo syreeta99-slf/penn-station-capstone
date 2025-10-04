@@ -12,7 +12,7 @@ Outputs:
 """
 
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 import io, json, zipfile
 import pandas as pd
 import subprocess, sys
@@ -367,18 +367,18 @@ def build_interfaces_123_ace(events_df: pd.DataFrame) -> pd.DataFrame:
 
         # Localize arrival
         arr_ts_local = pd.Timestamp(a["Best_Arrival"]).tz_convert("America/New_York")
-        arr_local_day = arr_ts_local.date()
+        arr_local_day = arr_ts_local.date()  # this is a datetime.date
 
         # Candidate departures in local tz
         dep_local = departures["Best_Departure"].dt.tz_convert("America/New_York")
         dep_local_day = dep_local.dt.date
 
         # Allow same-day OR next-day within 90 minutes post-midnight
-        next_day_ok = (
-            (dep_local_day == (arr_local_day + pd.Timedelta(days=1)).date()) &
-            (dep_local.dt.hour * 60 + dep_local.dt.minute <= 90)
-        )
+        next_day = arr_local_day + timedelta(days=1)  # <-- use datetime.timedelta here
+        within_90 = (dep_local.dt.hour * 60 + dep_local.dt.minute) <= 90
+
         same_day = dep_local_day == arr_local_day
+        next_day_ok = (dep_local_day == next_day) & within_90
 
         mask = (
             (departures["To_Node"] == tgt) &
@@ -386,6 +386,7 @@ def build_interfaces_123_ace(events_df: pd.DataFrame) -> pd.DataFrame:
             (departures["Best_Departure"] >= a["Best_Arrival"]) &
             (departures["Best_Departure"] <= a["Best_Arrival"] + pd.Timedelta(minutes=TRANSFER_WINDOW_MIN))
         )
+
         cand = departures.loc[mask].sort_values("Best_Departure").head(1)
 
         iid = f"{a['From_Node']}_{tgt}_{pd.Timestamp(a['Best_Arrival']).tz_convert('UTC').strftime('%Y%m%d_%H%M')}"
