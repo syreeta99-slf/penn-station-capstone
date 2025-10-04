@@ -27,8 +27,8 @@ CONFIG_PATH = Path("config/penn_stops.json")
 CURATED_DIR.mkdir(parents=True, exist_ok=True)
 
 # -------------------- PARAMETERS ---------------------
-TRANSFER_WINDOW_MIN = 20       # arrivals → next departure must be within this window
-MISSED_THRESHOLD_MIN = 2       # < 2 min gap (or no departure) ⇒ missed/unsafe
+TRANSFER_WINDOW_MIN = 25       # arrivals → next departure must be within this window
+MISSED_THRESHOLD_MIN = 3       # < 3 min gap (or no departure) ⇒ missed/unsafe
 
 AM_PEAK = range(6, 10)         # 06–09
 PM_PEAK = range(16, 20)        # 16–19
@@ -342,11 +342,19 @@ def build_interfaces_123_ace(events_df: pd.DataFrame) -> pd.DataFrame:
         tgt = a["Target_Node"]
         if not tgt:
             continue
-        mask = (
-            (departures["To_Node"] == tgt) &
-            (departures["Best_Departure"] >= a["Best_Arrival"]) &
-            (departures["Best_Departure"] <= a["Best_Arrival"] + pd.Timedelta(minutes=TRANSFER_WINDOW_MIN))
-        )
+    # Only pair if departure is same local day as arrival (NY time) and within window
+    arr_local_day = pd.Timestamp(a["Best_Arrival"]).tz_convert("America/New_York").date()
+
+    dep_local = departures["Best_Departure"].dt.tz_convert("America/New_York")
+    same_day = dep_local.dt.date == arr_local_day
+
+    mask = (
+        (departures["To_Node"] == tgt) &
+        same_day &
+        (departures["Best_Departure"] >= a["Best_Arrival"]) &
+        (departures["Best_Departure"] <= a["Best_Arrival"] + pd.Timedelta(minutes=TRANSFER_WINDOW_MIN))
+    )
+
         cand = departures.loc[mask].sort_values("Best_Departure").head(1)
 
         iid = f"{a['From_Node']}_{tgt}_{pd.Timestamp(a['Best_Arrival']).tz_convert('UTC').strftime('%Y%m%d_%H%M')}"
@@ -567,6 +575,25 @@ def main():
         print(f"{c}: n=0")
     else:
         print(f"{c}: n={n} mean={s.mean():.2f} p50={s.median():.2f} p90={s.quantile(0.9):.2f}")
+
+    # Gap quantiles (mins)
+    g = pd.to_numeric(interfaces.get("Transfer_Gap_Min"), errors="coerce")
+    if g.notna().any():
+        qs = g.quantile([0.1, 0.25, 0.5, 0.75, 0.9]).round(2)
+        print("\n[qc] Transfer_Gap_Min quantiles (10/25/50/75/90):")
+        print(qs.to_string())
+    else:
+    print("\n[qc] Transfer_Gap_Min: n=0")
+
+    # Negative vs positive delays (filled)
+    for name in ["Arrival_Delay_Min_Filled", "Departure_Delay_Min_Filled"]:
+        s = pd.to_numeric(interfaces.get(name), errors="coerce").dropna()
+        if s.empty:
+            print(f"[qc] {name}: n=0")
+        else:
+            neg = int((s < 0).sum()); pos = int((s > 0).sum())
+            print(f"[qc] {name}: n={len(s)} neg={neg} pos={pos} mean={s.mean():.2f} p50={s.median():.2f}")
+
 
     print("\n[qc] Sample:")
     print(interfaces.head(5)[[
