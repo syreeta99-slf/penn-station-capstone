@@ -37,11 +37,33 @@ jobs:
           (github.event_name == 'workflow_dispatch' && inputs.run_static_refresh == true)
         run: python pollers/mta_static_refresh.py
 
+        # Optional: verify the static file exists
+      - name: List static ZIPs
+        run: ls -lh gtfs_static || true
+
       # Pull realtime (protobuf) every scheduled run (and manual runs)
       - name: Poll MTA Subway realtime
         run: python pollers/mta_realtime_subway.py
-        # Upload the realtime CSVs so you can download them after the run
         
+      # Optional: peek at latest realtime stop_ids (diagnostic)
+      - name: Debug unique stop_ids
+        run: |
+          python - <<'EOF'
+          import pandas as pd, glob
+          files = sorted(glob.glob("data/realtime/*.csv"))
+          if files:
+              df = pd.read_csv(files[-1])
+              print("Unique stop_ids in latest CSV:", sorted(df["stop_id"].dropna().unique().tolist()))
+              print("Example rows:\n", df.head(5))
+          else:
+              print("No realtime CSVs found.")
+          EOF
+
+         # Build curated master (uses latest static ZIP + realtime)
+      - name: Build Master dataset
+        run: python pollers/build_master.py   
+        
+        # Upload the realtime CSVs so you can download them after the run
       - name: Upload realtime CSV artifact
         uses: actions/upload-artifact@v4
         with:
@@ -49,10 +71,15 @@ jobs:
           path: data/realtime/*.csv
           retention-days: 7
 
-      # Build curated master (uses latest static ZIP + realtime)
-      - name: Build Master dataset
-        run: python pollers/build_master.py
-
+      - name: Upload master dataset artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: master_interface_dataset
+          path: |
+            data/curated/master_interface_dataset.csv
+            data/curated/master_interface_dataset.parquet
+          retention-days: 14 
+    
       # --- Upload to Google Drive via rclone ---
 
       # Ensure curated folder exists (first run may be empty)
