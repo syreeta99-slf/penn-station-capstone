@@ -437,6 +437,16 @@ def main():
     # Time-based match (stop_id_norm + nearest time)
     events_at_penn = join_static_with_rt_time_based(sched, rt, tolerance_min=30)
 
+    # ... any cleaning of rt (renaming cols, normalizing stop ids, etc.)
+    print(f"[build_master] RT non-null counts: "
+      f"arr={rt['rt_arrival_utc'].notna().sum()} "
+      f"dep={rt['rt_departure_utc'].notna().sum()} "
+      f"stop_norm_missing={(rt['stop_id_norm'].isna().sum() if 'stop_id_norm' in rt.columns else 'NA')}")
+
+# now run the join
+events_at_penn = join_static_with_rt_time_based(sched, rt, tolerance_min=30)
+
+
     # Diagnostics
     total_sched = len(sched)
     rt_rows = len(rt)
