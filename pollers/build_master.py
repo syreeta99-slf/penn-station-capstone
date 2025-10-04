@@ -388,33 +388,33 @@ def build_interfaces_123_ace(events_df: pd.DataFrame) -> pd.DataFrame:
 
     iid = f"{a['From_Node']}_{tgt}_{pd.Timestamp(a['Best_Arrival']).tz_convert('UTC').strftime('%Y%m%d_%H%M')}"
 
-        if cand.empty:
-            # compute filled arrival delay from a (RT if present else scheduled vs scheduled)
-            arr_used = a["RT_Arrival"] if pd.notna(a["RT_Arrival"]) else a["Scheduled_Arrival"]
-            arr_delay_filled = _prefer(
-                a.get("Arrival_Delay_Min"),
-                _safe_delay_minutes(a.get("RT_Arrival"), a.get("Scheduled_Arrival")),
-                0.0
-            )
-            dep_delay_filled = pd.NA  # no departure chosen
+    if cand.empty:
+        # compute filled arrival delay from a (RT if present else scheduled vs scheduled)
+        arr_used = a["RT_Arrival"] if pd.notna(a["RT_Arrival"]) else a["Scheduled_Arrival"]
+        arr_delay_filled = _prefer(
+            a.get("Arrival_Delay_Min"),
+             _safe_delay_minutes(a.get("RT_Arrival"), a.get("Scheduled_Arrival")),
+            0.0
+        )
+        dep_delay_filled = pd.NA  # no departure chosen
 
 
-            out_rows.append({
-                "Interface_ID": iid,
-                "From_Node": a["From_Node"],
-                "To_Node": tgt,
-                "Link_Type": "Subway-Subway",
-                "Scheduled_Arrival": a.get("Scheduled_Arrival"),
-                "RT_Arrival": a.get("RT_Arrival"),
-                "Arrival_Delay_Min": a.get("Arrival_Delay_Min"),
-                "Arrival_Delay_Min_Filled": arr_delay_filled,
-                "Scheduled_Departure": pd.NaT,
-                "RT_Departure": pd.NaT,
-                "Departure_Delay_Min": pd.NA,
-                "Departure_Delay_Min_Filled": pd.NA,
-                "Transfer_Gap_Min": pd.NA,
-                "Missed_Transfer_Flag": True,
-                "Used_Scheduled_Fallback": bool(a["Used_Scheduled_Fallback"])
+        out_rows.append({
+            "Interface_ID": iid,
+            "From_Node": a["From_Node"],
+            "To_Node": tgt,
+            "Link_Type": "Subway-Subway",
+            "Scheduled_Arrival": a.get("Scheduled_Arrival"),
+            "RT_Arrival": a.get("RT_Arrival"),
+            "Arrival_Delay_Min": a.get("Arrival_Delay_Min"),
+            "Arrival_Delay_Min_Filled": arr_delay_filled,
+            "Scheduled_Departure": pd.NaT,
+            "RT_Departure": pd.NaT,
+            "Departure_Delay_Min": pd.NA,
+            "Departure_Delay_Min_Filled": pd.NA,
+            "Transfer_Gap_Min": pd.NA,
+            "Missed_Transfer_Flag": True,
+            "Used_Scheduled_Fallback": bool(a["Used_Scheduled_Fallback"])
             })
             continue
 
