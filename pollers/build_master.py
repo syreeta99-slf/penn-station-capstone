@@ -339,6 +339,22 @@ def build_interfaces_123_ace(events_df: pd.DataFrame) -> pd.DataFrame:
     departures["To_Node"] = departures["route_id"].apply(route_to_node)
 
     out_rows = []
+
+    def _safe_delay_minutes(rt_ts, sched_ts):
+        if pd.isna(rt_ts) and pd.isna(sched_ts):
+            return pd.NA
+        if pd.isna(rt_ts) and pd.notna(sched_ts):
+            return 0.0
+        if pd.notna(rt_ts) and pd.isna(sched_ts):
+            return 0.0
+        return (pd.to_datetime(rt_ts, utc=True) - pd.to_datetime(sched_ts, utc=True)).total_seconds() / 60.0
+
+    def _prefer(*vals):
+        for v in vals:
+            if not pd.isna(v):
+                return v
+        return pd.NA
+        
     for _, a in arrivals.iterrows():
         tgt = a["Target_Node"]
         if not tgt:
@@ -363,9 +379,13 @@ def build_interfaces_123_ace(events_df: pd.DataFrame) -> pd.DataFrame:
         if cand.empty:
             # compute filled arrival delay from a (RT if present else scheduled vs scheduled)
             arr_used = a["RT_Arrival"] if pd.notna(a["RT_Arrival"]) else a["Scheduled_Arrival"]
-            arr_delay_filled = (
-                pd.to_datetime(arr_used, utc=True) - pd.to_datetime(a.get("Scheduled_Arrival"), utc=True)
-            ).total_seconds() / 60.0 if pd.notna(a.get("Scheduled_Arrival")) else pd.NA
+            arr_delay_filled = _prefer(
+                a.get("Arrival_Delay_Min"),
+                _safe_delay_minutes(a.get("RT_Arrival"), a.get("Scheduled_Arrival")),
+                0.0
+            )
+            dep_delay_filled = pd.NA  # no departure chosen
+
 
             out_rows.append({
                 "Interface_ID": iid,
@@ -398,13 +418,18 @@ def build_interfaces_123_ace(events_df: pd.DataFrame) -> pd.DataFrame:
         arr_sched = a.get("Scheduled_Arrival")
         dep_sched = d.get("Scheduled_Departure")
 
-        arr_delay_filled = (
-            pd.to_datetime(arr_used, utc=True) - pd.to_datetime(arr_sched, utc=True)
-        ).total_seconds() / 60.0 if pd.notna(arr_sched) else pd.NA
+        arr_delay_filled = _prefer(
+            a.get("Arrival_Delay_Min"),
+            _safe_delay_minutes(a.get("RT_Arrival"), a.get("Scheduled_Arrival")),
+            0.0
+        )
 
-        dep_delay_filled = (
-            pd.to_datetime(dep_used, utc=True) - pd.to_datetime(dep_sched, utc=True)
-        ).total_seconds() / 60.0 if pd.notna(dep_sched) else pd.NA
+        dep_delay_filled = _prefer(
+            d.get("Departure_Delay_Min"),
+            _safe_delay_minutes(d.get("RT_Departure"), d.get("Scheduled_Departure")),
+            0.0
+        )
+
 
         out_rows.append({
             "Interface_ID": iid,
