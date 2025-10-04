@@ -536,6 +536,27 @@ def main():
     interfaces = add_time_features(interfaces)
     interfaces = add_placeholders_and_scores(interfaces)
 
+    # ---------- QC Diagnostics ----------
+    print("\n[qc] Interfaces by link:")
+    print(interfaces.groupby(["From_Node","To_Node"]).size().sort_values(ascending=False).head(10))
+
+    print("\n[qc] Time buckets:")
+    print(interfaces["Time_Period"].value_counts(dropna=False))
+
+    print("\n[qc] Missed-transfer rate:")
+    mt_rate = (interfaces["Missed_Transfer_Flag"] == True).mean()
+    print(f"Missed_Transfer_Flag rate: {mt_rate:.1%}")
+
+    print("\n[qc] Delay summary (min):")
+    for c in ["Arrival_Delay_Min","Departure_Delay_Min","Transfer_Gap_Min","Delay_Chain_Min"]:
+        s = pd.to_numeric(interfaces[c], errors="coerce")
+        print(f"{c}: n={s.notna().sum()} mean={s.mean():.2f} p50={s.median():.2f} p90={s.quantile(0.9):.2f}")
+
+    print("\n[qc] Sample:")
+    print(interfaces.head(5)[[
+        "Interface_ID","From_Node","To_Node","RT_Arrival","RT_Departure","Transfer_Gap_Min","Missed_Transfer_Flag"
+    ]])
+
     # ---------- C) De-dup the interface rows ----------
     before_if = len(interfaces)
     interfaces = interfaces.drop_duplicates(subset=[
