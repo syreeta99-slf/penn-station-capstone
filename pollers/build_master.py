@@ -360,19 +360,31 @@ def build_interfaces_123_ace(events_df: pd.DataFrame) -> pd.DataFrame:
         if not tgt:
             continue
 
-        # same-local-day pairing (NY time) within TRANSFER_WINDOW_MIN
-        arr_local_day = pd.Timestamp(a["Best_Arrival"]).tz_convert("America/New_York").date()
-        dep_local = departures["Best_Departure"].dt.tz_convert("America/New_York")
-        same_day = dep_local.dt.date == arr_local_day
+    # localize arrival
+    arr_ts_local = pd.Timestamp(a["Best_Arrival"]).tz_convert("America/New_York")
+    arr_local_day = arr_ts_local.date()
 
-        mask = (
-            (departures["To_Node"] == tgt) &
-            same_day &
-            (departures["Best_Departure"] >= a["Best_Arrival"]) &
-            (departures["Best_Departure"] <= a["Best_Arrival"] + pd.Timedelta(minutes=TRANSFER_WINDOW_MIN))
-        )
+    # candidate departure timestamps in local tz
+    dep_local = departures["Best_Departure"].dt.tz_convert("America/New_York")
+    dep_local_day = dep_local.dt.date
 
-        cand = departures.loc[mask].sort_values("Best_Departure").head(1)
+    # allow same-day OR next-day within 90 minutes of midnight
+    next_day_ok = (
+        (dep_local_day == (arr_local_day + pd.Timedelta(days=1)).date()) &
+        (dep_local.dt.hour * 60 + dep_local.dt.minute <= 90)
+    )
+
+    same_day = dep_local_day == arr_local_day
+
+    mask = (
+        (departures["To_Node"] == tgt) &
+        (same_day | next_day_ok) &
+        (departures["Best_Departure"] >= a["Best_Arrival"]) &
+        (departures["Best_Departure"] <= a["Best_Arrival"] + pd.Timedelta(minutes=TRANSFER_WINDOW_MIN))
+    )
+
+    cand = departures.loc[mask].sort_values("Best_Departure").head(1)
+
 
         iid = f"{a['From_Node']}_{tgt}_{pd.Timestamp(a['Best_Arrival']).tz_convert('UTC').strftime('%Y%m%d_%H%M')}"
 
