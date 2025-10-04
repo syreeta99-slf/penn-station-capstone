@@ -6,6 +6,9 @@ on:
     - cron: "*/10 10-15 * * 1-5"   # AM 06:00–11:59 ET (covers DST switch)
     - cron: "*/10 20-23 * * 1-5"   # PM 16:00–19:59 ET
     - cron: "*/10 0-1 * * 1-5"     # PM 20:00–21:59 ET
+    # --- Weekend light coverage, every 60 minutes ---
+    - cron: "0 12-2 * * 6,0"      # 08:00–22:59 ET (Sat & Sun)  [12–26Z wraps to 00–02 next day]
+    - cron: "0 3-3 * * 0"         # 23:00 ET Sunday overlap (optional tidy-up hour)
     # Weekly static refresh (Sun 03:10 UTC)
     - cron: "10 3 * * 0"
   workflow_dispatch:
