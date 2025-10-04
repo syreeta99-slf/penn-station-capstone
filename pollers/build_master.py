@@ -386,7 +386,7 @@ def build_interfaces_123_ace(events_df: pd.DataFrame) -> pd.DataFrame:
     cand = departures.loc[mask].sort_values("Best_Departure").head(1)
 
 
-        iid = f"{a['From_Node']}_{tgt}_{pd.Timestamp(a['Best_Arrival']).tz_convert('UTC').strftime('%Y%m%d_%H%M')}"
+    iid = f"{a['From_Node']}_{tgt}_{pd.Timestamp(a['Best_Arrival']).tz_convert('UTC').strftime('%Y%m%d_%H%M')}"
 
         if cand.empty:
             # compute filled arrival delay from a (RT if present else scheduled vs scheduled)
