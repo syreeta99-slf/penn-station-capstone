@@ -14,9 +14,34 @@ on:
         description: "Run GTFS static refresh now?"
         type: boolean
         default: false
+        
+      transfer_window_min:
+        description: "Transfer window (minutes)"
+        required: true
+        default: "20"
+      missed_threshold_min:
+        description: "Missed threshold (minutes)"
+        required: true
+        default: "2"
 
 jobs:
-  pipeline:
+ build-master:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run build_master
+        run: python pollers/build_master.py
+        env:
+          TRANSFER_WINDOW_MIN: ${{ github.event.inputs.transfer_window_min }}
+          MISSED_THRESHOLD_MIN: ${{ github.event.inputs.missed_threshold_min }}
+          
+ pipeline:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
