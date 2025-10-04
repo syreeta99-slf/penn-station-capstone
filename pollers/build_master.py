@@ -415,8 +415,8 @@ def build_interfaces_123_ace(events_df: pd.DataFrame) -> pd.DataFrame:
             "Transfer_Gap_Min": pd.NA,
             "Missed_Transfer_Flag": True,
             "Used_Scheduled_Fallback": bool(a["Used_Scheduled_Fallback"])
-            })
-            continue
+        })
+        continue
 
         d = cand.iloc[0]
 
