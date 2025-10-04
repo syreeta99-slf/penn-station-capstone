@@ -14,7 +14,6 @@ on:
         description: "Run GTFS static refresh now?"
         type: boolean
         default: false
-        
       transfer_window_min:
         description: "Transfer window (minutes)"
         required: true
@@ -25,35 +24,31 @@ on:
         default: "2"
 
 jobs:
- build-master:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: "3.11"
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-      - name: Run build_master
-        run: python pollers/build_master.py
-        env:
-          TRANSFER_WINDOW_MIN: ${{ github.event.inputs.transfer_window_min }}
-          MISSED_THRESHOLD_MIN: ${{ github.event.inputs.missed_threshold_min }}
-          
- pipeline:
+  pipeline:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: pip install -r requirements.txt
+
+      # Resolve thresholds for BOTH cron and manual runs (with defaults)
+      - name: Resolve threshold env vars
+        run: |
+          TW="${{ github.event.inputs.transfer_window_min }}"
+          MT="${{ github.event.inputs.missed_threshold_min }}"
+          # Defaults if inputs are empty (e.g., on scheduled runs)
+          [ -z "$TW" ] && TW=20
+          [ -z "$MT" ] && MT=2
+          echo "TRANSFER_WINDOW_MIN=$TW" >> "$GITHUB_ENV"
+          echo "MISSED_THRESHOLD_MIN=$MT" >> "$GITHUB_ENV"
+          echo "Resolved TRANSFER_WINDOW_MIN=$TW, MISSED_THRESHOLD_MIN=$MT"
 
       # Refresh GTFS static weekly (cron) OR when manually requested via the checkbox
       - name: Refresh GTFS static (weekly or manual)
@@ -76,11 +71,14 @@ jobs:
             ls -lh gtfs_static
           fi
 
-
-      # Pull realtime (protobuf) every scheduled run (and manual runs)
+      # Pull realtime (protobuf) every run (creates data/realtime/subway_rt_*.csv)
       - name: Poll MTA Subway realtime
-        run: python pollers/mta_realtime_subway.py
-        
+        run: |
+          mkdir -p data/realtime
+          python pollers/mta_realtime_subway.py
+          echo "Latest realtime CSVs:"
+          ls -lh data/realtime | tail -n 5
+
       # Optional: peek at latest realtime stop_ids (diagnostic)
       - name: Debug unique stop_ids
         run: |
@@ -89,15 +87,16 @@ jobs:
           files = sorted(glob.glob("data/realtime/*.csv"))
           if files:
               df = pd.read_csv(files[-1])
-              print("Unique stop_ids in latest CSV:", sorted(df["stop_id"].dropna().unique().tolist()))
+              print("Unique stop_ids in latest CSV:", sorted(df["stop_id"].dropna().unique().tolist())[:25])
               print("Example rows:\n", df.head(5))
           else:
               print("No realtime CSVs found.")
           EOF
 
-         # Build curated master (uses latest static ZIP + realtime)
+      # Build curated master (uses latest static ZIP + realtime)
+      # Picks up TRANSFER_WINDOW_MIN and MISSED_THRESHOLD_MIN from $GITHUB_ENV
       - name: Build Master dataset
-        run: python pollers/build_master.py  
+        run: python pollers/build_master.py
 
       - name: Upload debug joined events (artifact)
         uses: actions/upload-artifact@v4
@@ -105,8 +104,8 @@ jobs:
           name: debug_events_at_penn
           path: data/curated/_debug_events_at_penn.csv
           retention-days: 5
-          
-        # Upload the realtime CSVs so you can download them after the run
+
+      # Upload the realtime CSVs for inspection
       - name: Upload realtime CSV artifact
         uses: actions/upload-artifact@v4
         with:
@@ -121,33 +120,27 @@ jobs:
           path: |
             data/curated/master_interface_dataset.csv
             data/curated/master_interface_dataset.parquet
-          retention-days: 14 
-    
-      # --- Upload to Google Drive via rclone ---
+            data/curated/master_interface_dataset_summary.json
+          retention-days: 14
 
-      # Ensure curated folder exists (first run may be empty)
+      # --- Upload to Google Drive via rclone ---
       - name: Ensure curated folder exists
         run: mkdir -p data/curated
 
-      # Install rclone on the runner
       - name: Install rclone
         run: curl -fsSL https://rclone.org/install.sh | sudo bash
 
-      # Decode your Base64 rclone.conf secret into the runner
       - name: Write rclone.conf from Base64 secret
         run: |
           mkdir -p ~/.config/rclone
           echo "${{ secrets.RCLONE_CONF_B64 }}" | base64 -d > ~/.config/rclone/rclone.conf
           chmod 600 ~/.config/rclone/rclone.conf
 
-      # Sanity check: confirm the remote exists and is reachable
-      # Replace 'googledrive' if your remote name differs
       - name: Verify rclone remote
         run: |
           rclone listremotes
           rclone lsd googledrive: || (echo "Remote 'googledrive' not found; check your remote name and secret" && exit 1)
 
-      # Copy curated outputs to Google Drive (My Drive/penn-station/curated)
       - name: Upload curated dataset to Google Drive
         run: |
           if [ -z "$(ls -A data/curated || true)" ]; then
@@ -157,8 +150,7 @@ jobs:
               --create-empty-src-dirs --checksum --transfers=4 --checkers=8
           fi
 
-      # Optional: also save curated files as a workflow artifact
-      - name: Upload curated artifacts
+      - name: Upload curated artifacts (all)
         uses: actions/upload-artifact@v4
         with:
           name: curated_${{ github.run_id }}
