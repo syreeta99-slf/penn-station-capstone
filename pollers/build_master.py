@@ -286,12 +286,28 @@ def join_static_with_rt_time_based(sched_df: pd.DataFrame, rt_df: pd.DataFrame, 
         pd.to_datetime(out["RT_Departure"], utc=True) - pd.to_datetime(out["Scheduled_Departure"], utc=True)
     ).dt.total_seconds() / 60.0
 
+    # ---- Filled delays: fall back to scheduled when RT is missing ----
+    out["Used_Arrival"] = out["RT_Arrival"].combine_first(out["Scheduled_Arrival"])
+    out["Used_Departure"] = out["RT_Departure"].combine_first(out["Scheduled_Departure"])
+
+    out["Arrival_Delay_Min_Filled"] = (
+        pd.to_datetime(out["Used_Arrival"], utc=True) - pd.to_datetime(out["Scheduled_Arrival"], utc=True)
+    ).dt.total_seconds() / 60.0
+
+    out["Departure_Delay_Min_Filled"] = (
+        pd.to_datetime(out["Used_Departure"], utc=True) - pd.to_datetime(out["Scheduled_Departure"], utc=True)
+    ).dt.total_seconds() / 60.0
+
+ 
     # ---- Final schema ----
     keep = [
         "trip_id", "route_id", "stop_id", "stop_id_norm",
         "Scheduled_Arrival", "RT_Arrival", "Arrival_Delay_Min",
         "Scheduled_Departure", "RT_Departure", "Departure_Delay_Min",
+        "Used_Arrival", "Used_Departure",
+        "Arrival_Delay_Min_Filled", "Departure_Delay_Min_Filled",
     ]
+
     for c in keep:
         if c not in out.columns:
             out[c] = pd.NA
@@ -407,37 +423,37 @@ def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def add_placeholders_and_scores(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Ensure downstream score/placeholder fields exist and compute a simple delay-chain metric.
-    Safe to call on empty or partially-populated frames.
-    """
     if df.empty:
-        # still ensure the columns exist for downstream schema selection
-        cols_to_init = [
-            "Arrival_Delay_Min", "Departure_Delay_Min",
-            "Delay_Chain_Min", "Avg_Flow_Volume", "Peak_Flow_Volume",
-            "Daily_Ridership_Share_%", "Delay_Frequency_%",
-            "Avg_Delay_Min", "Chain_Reaction_Factor", "Alt_Path_Available",
-            "Criticality_Score", "Ped_Count", "Stress_Index",
-            "External_Pressure", "Incident_History",
-        ]
-        for c in cols_to_init:
+        for c in [
+            "Arrival_Delay_Min","Departure_Delay_Min",
+            "Arrival_Delay_Min_Filled","Departure_Delay_Min_Filled",
+            "Delay_Chain_Min","Avg_Flow_Volume","Peak_Flow_Volume",
+            "Daily_Ridership_Share_%","Delay_Frequency_%","Avg_Delay_Min",
+            "Chain_Reaction_Factor","Alt_Path_Available","Criticality_Score",
+            "Ped_Count","Stress_Index","External_Pressure","Incident_History",
+        ]:
             if c not in df.columns:
                 df[c] = pd.NA
         return df
 
-    # Ensure delay cols exist
-    for col in ["Arrival_Delay_Min", "Departure_Delay_Min"]:
+    # Ensure both original and filled delay cols exist
+    for col in [
+        "Arrival_Delay_Min","Departure_Delay_Min",
+        "Arrival_Delay_Min_Filled","Departure_Delay_Min_Filled",
+    ]:
         if col not in df.columns:
             df[col] = pd.NA
 
-    # Simple chain metric (can refine later)
-    df["Delay_Chain_Min"] = (
-        pd.to_numeric(df["Arrival_Delay_Min"], errors="coerce").fillna(0)
-        + pd.to_numeric(df["Departure_Delay_Min"], errors="coerce").fillna(0)
-    )
+    # Use *filled* delays when available, else fallback to originals, else 0
+    arr = pd.to_numeric(df["Arrival_Delay_Min_Filled"], errors="coerce")
+    dep = pd.to_numeric(df["Departure_Delay_Min_Filled"], errors="coerce")
 
-    # Ensure placeholders exist
+    arr = arr.fillna(pd.to_numeric(df["Arrival_Delay_Min"], errors="coerce"))
+    dep = dep.fillna(pd.to_numeric(df["Departure_Delay_Min"], errors="coerce"))
+
+    df["Delay_Chain_Min"] = arr.fillna(0) + dep.fillna(0)
+
+    # Placeholders
     for col in [
         "Avg_Flow_Volume","Peak_Flow_Volume","Daily_Ridership_Share_%",
         "Delay_Frequency_%","Avg_Delay_Min","Chain_Reaction_Factor",
@@ -446,11 +462,7 @@ def add_placeholders_and_scores(df: pd.DataFrame) -> pd.DataFrame:
     ]:
         if col not in df.columns:
             df[col] = pd.NA
-
     return df
-
-
-
 
 # ----------------------- MAIN ------------------------
 def main():
@@ -536,7 +548,7 @@ def main():
     interfaces = add_time_features(interfaces)
     interfaces = add_placeholders_and_scores(interfaces)
 
-    # ---------- QC Diagnostics ----------
+  # ---------- QC Diagnostics (place right before final column order & save) ----------
     print("\n[qc] Interfaces by link:")
     print(interfaces.groupby(["From_Node","To_Node"]).size().sort_values(ascending=False).head(10))
 
@@ -545,17 +557,24 @@ def main():
 
     print("\n[qc] Missed-transfer rate:")
     mt_rate = (interfaces["Missed_Transfer_Flag"] == True).mean()
-    print(f"Missed_Transfer_Flag rate: {mt_rate:.1%}")
+    print(f"Missed_Transfer_Flag rate: {0.0 if pd.isna(mt_rate) else mt_rate:.1%}")
 
     print("\n[qc] Delay summary (min):")
-    for c in ["Arrival_Delay_Min","Departure_Delay_Min","Transfer_Gap_Min","Delay_Chain_Min"]:
-        s = pd.to_numeric(interfaces[c], errors="coerce")
-        print(f"{c}: n={s.notna().sum()} mean={s.mean():.2f} p50={s.median():.2f} p90={s.quantile(0.9):.2f}")
+    for c in ["Arrival_Delay_Min_Filled","Departure_Delay_Min_Filled","Transfer_Gap_Min","Delay_Chain_Min"]:
+        s = pd.to_numeric(interfaces.get(c), errors="coerce")
+        n = int(s.notna().sum())
+    if n == 0:
+        print(f"{c}: n=0")
+    else:
+        print(f"{c}: n={n} mean={s.mean():.2f} p50={s.median():.2f} p90={s.quantile(0.9):.2f}")
 
     print("\n[qc] Sample:")
     print(interfaces.head(5)[[
-        "Interface_ID","From_Node","To_Node","RT_Arrival","RT_Departure","Transfer_Gap_Min","Missed_Transfer_Flag"
+        "Interface_ID","From_Node","To_Node","RT_Arrival","RT_Departure",
+        "Arrival_Delay_Min_Filled","Departure_Delay_Min_Filled",
+        "Transfer_Gap_Min","Missed_Transfer_Flag"
     ]])
+# ---------- End QC Diagnostics ----------
 
     # ---------- C) De-dup the interface rows ----------
     before_if = len(interfaces)
@@ -570,7 +589,9 @@ def main():
     cols = [
         "Interface_ID","From_Node","To_Node","Link_Type",
         "Scheduled_Arrival","RT_Arrival","Arrival_Delay_Min",
+        "Arrival_Delay_Min_Filled",  # new
         "Scheduled_Departure","RT_Departure","Departure_Delay_Min",
+        "Departure_Delay_Min_Filled",  # new
         "Transfer_Gap_Min","Missed_Transfer_Flag",
         "Avg_Flow_Volume","Peak_Flow_Volume","Daily_Ridership_Share_%",
         "Delay_Frequency_%","Avg_Delay_Min","Delay_Chain_Min","Chain_Reaction_Factor",
