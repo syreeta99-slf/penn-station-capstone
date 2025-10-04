@@ -387,11 +387,20 @@ def build_interfaces_123_ace(events_df: pd.DataFrame) -> pd.DataFrame:
             (departures["Best_Departure"] <= a["Best_Arrival"] + pd.Timedelta(minutes=TRANSFER_WINDOW_MIN))
         )
 
-        cand = departures.loc[mask].sort_values("Best_Departure").head(1)
+        cand = departures.loc[mask].copy()
+        if not cand.empty:
+            # compute gap for each candidate and keep only viable ones
+            cand["gap_min"] = (
+                pd.to_datetime(cand["Best_Departure"], utc=True) - pd.to_datetime(a["Best_Arrival"], utc=True)
+            ).dt.total_seconds() / 60.0
+            viable = cand[cand["gap_min"] >= MISSED_THRESHOLD_MIN].sort_values("Best_Departure")
+        else:
+            viable = cand  # empty
 
         iid = f"{a['From_Node']}_{tgt}_{pd.Timestamp(a['Best_Arrival']).tz_convert('UTC').strftime('%Y%m%d_%H%M')}"
 
-        if cand.empty:
+        if viable.empty:
+            # (no viable departure within window) -> missed
             arr_delay_filled = _prefer(
                 a.get("Arrival_Delay_Min"),
                 _safe_delay_minutes(a.get("RT_Arrival"), a.get("Scheduled_Arrival")),
@@ -416,9 +425,10 @@ def build_interfaces_123_ace(events_df: pd.DataFrame) -> pd.DataFrame:
             })
             continue
 
-        # Matched case
-        d = cand.iloc[0]
-        gap_min = (pd.Timestamp(d["Best_Departure"]) - pd.Timestamp(a["Best_Arrival"])).total_seconds() / 60.0
+        # matched case with a viable gap
+        d = viable.iloc[0]
+        gap_min = float(d["gap_min"])
+
 
         arr_delay_filled = _prefer(
             a.get("Arrival_Delay_Min"),
