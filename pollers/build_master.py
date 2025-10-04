@@ -329,7 +329,8 @@ def build_interfaces_123_ace(events_df: pd.DataFrame) -> pd.DataFrame:
 
     df["Target_Node"] = df["From_Node"].apply(other)
 
-    df["Best_Arrival"] = df["RT_Arrival"].combine_first(df["Scheduled_Arrival"])
+    # Pick best timestamps (RT preferred, else scheduled)
+    df["Best_Arrival"]   = df["RT_Arrival"].combine_first(df["Scheduled_Arrival"])
     df["Best_Departure"] = df["RT_Departure"].combine_first(df["Scheduled_Departure"])
     df["Used_Scheduled_Fallback"] = df["RT_Arrival"].isna() | df["RT_Departure"].isna()
 
@@ -342,9 +343,9 @@ def build_interfaces_123_ace(events_df: pd.DataFrame) -> pd.DataFrame:
         tgt = a["Target_Node"]
         if not tgt:
             continue
-    # Only pair if departure is same local day as arrival (NY time) and within window
-        arr_local_day = pd.Timestamp(a["Best_Arrival"]).tz_convert("America/New_York").date()
 
+        # same-local-day pairing (NY time) within TRANSFER_WINDOW_MIN
+        arr_local_day = pd.Timestamp(a["Best_Arrival"]).tz_convert("America/New_York").date()
         dep_local = departures["Best_Departure"].dt.tz_convert("America/New_York")
         same_day = dep_local.dt.date == arr_local_day
 
@@ -360,6 +361,12 @@ def build_interfaces_123_ace(events_df: pd.DataFrame) -> pd.DataFrame:
         iid = f"{a['From_Node']}_{tgt}_{pd.Timestamp(a['Best_Arrival']).tz_convert('UTC').strftime('%Y%m%d_%H%M')}"
 
         if cand.empty:
+            # compute filled arrival delay from a (RT if present else scheduled vs scheduled)
+            arr_used = a["RT_Arrival"] if pd.notna(a["RT_Arrival"]) else a["Scheduled_Arrival"]
+            arr_delay_filled = (
+                pd.to_datetime(arr_used, utc=True) - pd.to_datetime(a.get("Scheduled_Arrival"), utc=True)
+            ).total_seconds() / 60.0 if pd.notna(a.get("Scheduled_Arrival")) else pd.NA
+
             out_rows.append({
                 "Interface_ID": iid,
                 "From_Node": a["From_Node"],
@@ -368,9 +375,11 @@ def build_interfaces_123_ace(events_df: pd.DataFrame) -> pd.DataFrame:
                 "Scheduled_Arrival": a.get("Scheduled_Arrival"),
                 "RT_Arrival": a.get("RT_Arrival"),
                 "Arrival_Delay_Min": a.get("Arrival_Delay_Min"),
+                "Arrival_Delay_Min_Filled": arr_delay_filled,
                 "Scheduled_Departure": pd.NaT,
                 "RT_Departure": pd.NaT,
                 "Departure_Delay_Min": pd.NA,
+                "Departure_Delay_Min_Filled": pd.NA,
                 "Transfer_Gap_Min": pd.NA,
                 "Missed_Transfer_Flag": True,
                 "Used_Scheduled_Fallback": bool(a["Used_Scheduled_Fallback"])
@@ -378,7 +387,24 @@ def build_interfaces_123_ace(events_df: pd.DataFrame) -> pd.DataFrame:
             continue
 
         d = cand.iloc[0]
+
+        # compute transfer gap
         gap_min = (pd.Timestamp(d["Best_Departure"]) - pd.Timestamp(a["Best_Arrival"])).total_seconds() / 60.0
+
+        # compute filled delays for arrival and departure
+        arr_used = a["RT_Arrival"] if pd.notna(a["RT_Arrival"]) else a["Scheduled_Arrival"]
+        dep_used = d["RT_Departure"] if pd.notna(d["RT_Departure"]) else d["Scheduled_Departure"]
+
+        arr_sched = a.get("Scheduled_Arrival")
+        dep_sched = d.get("Scheduled_Departure")
+
+        arr_delay_filled = (
+            pd.to_datetime(arr_used, utc=True) - pd.to_datetime(arr_sched, utc=True)
+        ).total_seconds() / 60.0 if pd.notna(arr_sched) else pd.NA
+
+        dep_delay_filled = (
+            pd.to_datetime(dep_used, utc=True) - pd.to_datetime(dep_sched, utc=True)
+        ).total_seconds() / 60.0 if pd.notna(dep_sched) else pd.NA
 
         out_rows.append({
             "Interface_ID": iid,
@@ -388,9 +414,11 @@ def build_interfaces_123_ace(events_df: pd.DataFrame) -> pd.DataFrame:
             "Scheduled_Arrival": a.get("Scheduled_Arrival"),
             "RT_Arrival": a.get("RT_Arrival"),
             "Arrival_Delay_Min": a.get("Arrival_Delay_Min"),
+            "Arrival_Delay_Min_Filled": arr_delay_filled,
             "Scheduled_Departure": d.get("Scheduled_Departure"),
             "RT_Departure": d.get("RT_Departure"),
             "Departure_Delay_Min": d.get("Departure_Delay_Min"),
+            "Departure_Delay_Min_Filled": dep_delay_filled,
             "Transfer_Gap_Min": gap_min,
             "Missed_Transfer_Flag": (gap_min < MISSED_THRESHOLD_MIN),
             "Used_Scheduled_Fallback": bool(a["Used_Scheduled_Fallback"])
