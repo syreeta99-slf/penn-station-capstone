@@ -93,7 +93,7 @@ def load_realtime_events() -> pd.DataFrame:
     if not files:
         raise FileNotFoundError("No realtime CSVs in data/realtime/. Run the realtime poller first.")
     # Use several recent snapshots; dedupe by (trip_id, stop_id, source_minute_utc)
-    dfs = [pd.read_csv(f) for f in files[-12:]]
+    dfs = [pd.read_csv(f) for f in files[-60:]]
     df = pd.concat(dfs, ignore_index=True)
 
     # Ensure tz-aware UTC
@@ -133,18 +133,18 @@ def join_static_with_rt(sched_df: pd.DataFrame, rt_df: pd.DataFrame) -> pd.DataF
         "rt_departure_utc": "RT_Departure"
     })[["trip_id", "stop_id", "route_id", "RT_Arrival", "RT_Departure"]]
 
-    df = sched_df.merge(rt2, on=["trip_id", "stop_id"], how="left", suffixes=("_sched", "_rt"))
+    # Use INNER join so we only keep rows that actually matched RT
+    df = sched_df.merge(rt2, on=["trip_id", "stop_id"], how="inner", suffixes=("_sched", "_rt"))
 
-    # Coalesce route_id from RT/static → unified `route_id`
+    # Coalesce route_id
     if "route_id_rt" in df.columns or "route_id_sched" in df.columns:
         df["route_id"] = df.get("route_id_rt").combine_first(df.get("route_id_sched"))
         for c in ["route_id_rt", "route_id_sched"]:
             if c in df.columns:
                 df.drop(columns=c, inplace=True)
 
-    # Both sides are tz-aware UTC → safe to subtract
-    df["Arrival_Delay_Min"]   = (df["RT_Arrival"]   - df["Scheduled_Arrival"]).dt.total_seconds() / 60.0
-    df["Departure_Delay_Min"] = (df["RT_Departure"] - df["Scheduled_Departure"]).dt.total_seconds() / 60.0
+    df["Arrival_Delay_Min"]   = (df["RT_Arrival"]   - df["Scheduled_Arrival"]).dt.total_seconds()/60.0
+    df["Departure_Delay_Min"] = (df["RT_Departure"] - df["Scheduled_Departure"]).dt.total_seconds()/60.0
     return df
 
 # --------------- INTERFACE CONSTRUCTION --------------
@@ -291,6 +291,36 @@ def main():
     # Load scheduled rows at Penn (tz-aware UTC), then join + delays
     sched = load_scheduled_at_penn(service_date, penn_ids)
     events_at_penn = join_static_with_rt(sched, rt)
+
+    total_sched = len(sched)
+    rt_rows = len(rt)
+    evt = len(events_at_penn)
+    with_rt_arr = events_at_penn["RT_Arrival"].notna().sum()
+    with_rt_dep = events_at_penn["RT_Departure"].notna().sum()
+    print(f"[build_master] sched_rows={total_sched}  rt_rows={rt_rows}  joined={evt} "
+      f"with_RT_Arr={with_rt_arr} with_RT_Dep={with_rt_dep}")
+
+    # (Optional) save a debug copy so you can download it as an artifact
+    events_at_penn.to_csv("data/curated/_debug_events_at_penn.csv", index=False)
+
+    
+    # Compute RT time window
+    rt_times = pd.concat([rt.get("rt_arrival_utc"), rt.get("rt_departure_utc")], ignore_index=True).dropna()
+    if not rt_times.empty:
+        rt_min = rt_times.min()
+        rt_max = rt_times.max()
+        pad = pd.Timedelta(minutes=60)
+        rt_min, rt_max = rt_min - pad, rt_max + pad
+
+        # Keep static rows that fall within (rt_min, rt_max) on either arr or dep
+        before = len(sched)
+        sched = sched[
+            sched["Scheduled_Arrival"].between(rt_min, rt_max) |
+            sched["Scheduled_Departure"].between(rt_min, rt_max)
+        ].copy()
+        print(f"[build_master] Filtered static to RT window: {before} → {len(sched)} rows")
+    else:
+        print("[build_master] No RT times found; skipping static time window filter.")
 
     # Warn if RT didn't match much (helps diagnose stop_ids/trip_id mismatches)
     n_total = len(events_at_penn)
