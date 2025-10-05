@@ -1,6 +1,6 @@
 name: Backfill event-level dataset for a past date
 
-# Prevent overlapping backfills from canceling each other
+# Each date gets its own concurrency group; backfills don't cancel each other.
 concurrency:
   group: backfill-${{ github.ref }}-${{ inputs.backfill_date }}
   cancel-in-progress: false
@@ -13,14 +13,14 @@ on:
         required: true
         type: string
       artifact_name:
-        description: "Name of the realtime CSVs artifact from your main workflow"
+        description: "Per-run realtime artifact name from pipeline (default matches pipeline.yml)"
         required: true
         default: "subway_realtime_csvs"
         type: string
       source_workflow_filename:
         description: "Your main pipeline workflow filename in .github/workflows/"
         required: true
-        default: "mta.yml"  # change at run time if yours is pipeline.yml
+        default: "pipeline.yml"  # set to your actual pipeline workflow filename
         type: string
       transfer_window_min:
         description: "Transfer window minutes"
@@ -34,15 +34,12 @@ on:
         type: string
 
 jobs:
-  backfill:
+  merge_rt:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 30
     permissions:
       contents: read
       actions: read
-    env:
-      # make the secret available as an env var for if: guards
-      RCLONE_CONF_B64: ${{ secrets.RCLONE_CONF_B64 }}
 
     steps:
       - uses: actions/checkout@v4
@@ -69,8 +66,30 @@ jobs:
           echo "START=${{ inputs.backfill_date }}T00:00:00Z" >> $GITHUB_OUTPUT
           echo "END=${{ inputs.backfill_date }}T23:59:59Z" >> $GITHUB_OUTPUT
 
+      # ---- Fast path: try the single per-day artifact first ----
+      - name: Try daily artifact fast-path
+        id: daily
+        timeout-minutes: 5
+        run: |
+          DATE="${{ steps.vars.outputs.DATE }}"
+          mkdir -p "data/realtime/${DATE}"
+          gh api "/repos/${{ github.repository }}/actions/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.name=="rt_day_'${DATE}'") | .id' > day_artifact_id.txt
+          if [ -s day_artifact_id.txt ]; then
+            AID=$(head -n1 day_artifact_id.txt)
+            echo "Found daily artifact id=$AID"
+            gh api "/repos/${{ github.repository }}/actions/artifacts/${AID}/zip" > "rt_day_${DATE}.zip"
+            unzip -o "rt_day_${DATE}.zip" -d "data/realtime/${DATE}/"
+            echo "found=true" >> $GITHUB_OUTPUT
+          else
+            echo "No daily artifact for ${DATE}"
+            echo "found=false" >> $GITHUB_OUTPUT
+          fi
+
+      # ---- Fallback: stitch individual per-run artifacts for that date ----
       - name: Find workflow id
         id: wf
+        if: steps.daily.outputs.found == 'false'
         run: |
           WF_FILE="${{ steps.vars.outputs.WF_FILE }}"
           WF_ID=$(gh api /repos/${{ github.repository }}/actions/workflows \
@@ -81,6 +100,7 @@ jobs:
 
       - name: List runs on that date
         id: runs
+        if: steps.daily.outputs.found == 'false'
         run: |
           WF_ID="${{ steps.wf.outputs.WF_ID }}"
           gh api "/repos/${{ github.repository }}/actions/workflows/${WF_ID}/runs?per_page=200" \
@@ -92,8 +112,8 @@ jobs:
           echo "COUNT=$COUNT" >> $GITHUB_OUTPUT
           echo "Found $COUNT runs"
 
-      - name: Download & merge realtime artifacts
-        if: steps.runs.outputs.COUNT != '0'
+      - name: Download & merge realtime artifacts (fallback)
+        if: steps.daily.outputs.found == 'false' && steps.runs.outputs.COUNT != '0'
         timeout-minutes: 15
         run: |
           DATE="${{ steps.vars.outputs.DATE }}"
@@ -114,7 +134,38 @@ jobs:
           DATE="${{ steps.vars.outputs.DATE }}"
           ls "data/realtime/${DATE}"/*.csv 1>/dev/null 2>&1 || { echo "No CSVs found"; exit 1; }
 
-      # Cache + prime static GTFS so we don't re-download every run
+      - name: Upload merged RT for next job
+        uses: actions/upload-artifact@v4
+        with:
+          name: rt_merged_${{ steps.vars.outputs.DATE }}
+          path: data/realtime/${{ steps.vars.outputs.DATE }}/**
+          retention-days: 3
+
+  build_master:
+    needs: merge_rt
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Download merged RT from previous job
+        uses: actions/download-artifact@v4
+        with:
+          name: rt_merged_${{ github.event.inputs.backfill_date }}
+          path: data/realtime/${{ github.event.inputs.backfill_date }}
+
+      # Cache & prime static GTFS once here
       - name: Cache GTFS static
         id: gtfs_cache
         uses: actions/cache@v4
@@ -145,15 +196,16 @@ jobs:
         env:
           PYTHONUNBUFFERED: "1"             # stream Python logs live
           ALLOW_STATIC_REFRESH: "0"         # fail fast if static is missing
-          RT_DIR: data/realtime/${{ steps.vars.outputs.DATE }}
+          RT_DIR: data/realtime/${{ github.event.inputs.backfill_date }}
           RT_MAX_FILES: "999999"
-          SERVICE_DATE: ${{ steps.vars.outputs.DATE }}
-          TRANSFER_WINDOW_MIN: ${{ inputs.transfer_window_min }}
-          MISSED_THRESHOLD_MIN: ${{ inputs.missed_threshold_min }}
+          SERVICE_DATE: ${{ github.event.inputs.backfill_date }}
+          TRANSFER_WINDOW_MIN: ${{ github.event.inputs.transfer_window_min }}
+          MISSED_THRESHOLD_MIN: ${{ github.event.inputs.missed_threshold_min }}
         run: |
-          set -euo pipefai
-          echo "RT files:"; ls -lh "data/realtime/${{ steps.vars.outputs.DATE }}" | sed -n '1,80p'
-          trap 'echo "::warning:: Received SIGTERM at $(date -u). Runner likely canceled the step."' TERM
+          set -euo pipefail
+          echo "RT files:"
+          ls -lh "data/realtime/${{ github.event.inputs.backfill_date }}" | sed -n '1,120p'
+          trap 'echo "::warning:: Received SIGTERM during build_master at $(date -u)"; exit 143' SIGTERM
           echo "Starting build_master…"
           python pollers/build_master.py
 
@@ -161,29 +213,29 @@ jobs:
         timeout-minutes: 10
         uses: actions/upload-artifact@v4
         with:
-          name: curated_backfill_${{ steps.vars.outputs.DATE }}
+          name: curated_backfill_${{ github.event.inputs.backfill_date }}
           path: |
             data/curated/master_interface_dataset.csv
             data/curated/master_interface_dataset.parquet
             data/curated/master_interface_agg.csv
             data/curated/master_interface_agg.parquet
             data/curated/master_interface_dataset_summary.json
-            data/curated/service_date=${{ steps.vars.outputs.DATE }}/**
+            data/curated/service_date=${{ github.event.inputs.backfill_date }}/**
           retention-days: 30
 
-      # Optional: push curated history to Google Drive
+      # Optional: push curated history to Google Drive (requires RCLONE_CONF_B64 secret)
       - name: Install rclone
         run: curl -fsSL https://rclone.org/install.sh | sudo bash
 
       - name: Write rclone.conf
-        if: ${{ env.RCLONE_CONF_B64 != '' }}
+        if: ${{ secrets.RCLONE_CONF_B64 != '' }}
         run: |
           mkdir -p ~/.config/rclone
-          echo "${RCLONE_CONF_B64}" | base64 -d > ~/.config/rclone/rclone.conf
+          echo "${{ secrets.RCLONE_CONF_B64 }}" | base64 -d > ~/.config/rclone/rclone.conf
           chmod 600 ~/.config/rclone/rclone.conf
 
       - name: Sync curated to Drive (optional)
-        if: ${{ env.RCLONE_CONF_B64 != '' }}
+        if: ${{ secrets.RCLONE_CONF_B64 != '' }}
         timeout-minutes: 15
         run: |
           rclone copy data/curated googledrive:penn-station/curated \
