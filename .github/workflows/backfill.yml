@@ -1,5 +1,6 @@
 name: Backfill event-level dataset for a past date
 
+# Prevent overlapping backfills from canceling each other
 concurrency:
   group: backfill-${{ github.ref }}-${{ inputs.backfill_date }}
   cancel-in-progress: false
@@ -19,7 +20,7 @@ on:
       source_workflow_filename:
         description: "Your main pipeline workflow filename in .github/workflows/"
         required: true
-        default: "mta.yml"   # <-- set to pipeline.yml when you run it if that's your file name
+        default: "mta.yml"  # change at run time if yours is pipeline.yml
         type: string
       transfer_window_min:
         description: "Transfer window minutes"
@@ -27,7 +28,7 @@ on:
         default: "20"
         type: string
       missed_threshold_min:
-        description: "Missed threshold minutes"
+        description: "Missed transfer threshold minutes"
         required: true
         default: "2"
         type: string
@@ -93,6 +94,7 @@ jobs:
 
       - name: Download & merge realtime artifacts
         if: steps.runs.outputs.COUNT != '0'
+        timeout-minutes: 15
         run: |
           DATE="${{ steps.vars.outputs.DATE }}"
           ART="${{ steps.vars.outputs.ART }}"
@@ -112,23 +114,24 @@ jobs:
           DATE="${{ steps.vars.outputs.DATE }}"
           ls "data/realtime/${DATE}"/*.csv 1>/dev/null 2>&1 || { echo "No CSVs found"; exit 1; }
 
-      # --------- NEW: cache & prime static GTFS so we don't refetch every run ----------
+      # Cache + prime static GTFS so we don't re-download every run
       - name: Cache GTFS static
-        id: gtfs_cache      
+        id: gtfs_cache
         uses: actions/cache@v4
         with:
           path: gtfs_static
           key: gtfs-static-v1
           restore-keys: |
             gtfs-static-
-            
+
       - name: Show cache status & list gtfs_static
         run: |
           echo "cache-hit=${{ steps.gtfs_cache.outputs.cache-hit }}"
           ls -lh gtfs_static || true
-          ls -lh gtfs_static/*.zip 2>/dev/null || echo "No static zips yet."      
+          ls -lh gtfs_static/*.zip 2>/dev/null || echo "No static zips yet."
 
       - name: Prime static GTFS if missing
+        timeout-minutes: 10
         run: |
           if ls gtfs_static/subway_all_*.zip 1>/dev/null 2>&1; then
             echo "Static GTFS already present. Skipping refresh."
@@ -136,12 +139,12 @@ jobs:
             echo "No static GTFS found. Refreshing…"
             python pollers/mta_static_refresh.py
           fi
-      # ---------------------------------------------------------------------------------
 
       - name: Run build_master once on the merged folder
+        timeout-minutes: 40
         env:
-          PYTHONUNBUFFERED: "1"             # stream logs live
-          ALLOW_STATIC_REFRESH: "0"         # don't silently refresh here
+          PYTHONUNBUFFERED: "1"             # stream Python logs live
+          ALLOW_STATIC_REFRESH: "0"         # fail fast if static is missing
           RT_DIR: data/realtime/${{ steps.vars.outputs.DATE }}
           RT_MAX_FILES: "999999"
           SERVICE_DATE: ${{ steps.vars.outputs.DATE }}
@@ -149,11 +152,12 @@ jobs:
           MISSED_THRESHOLD_MIN: ${{ inputs.missed_threshold_min }}
         run: |
           echo "RT files:"
-          ls -lh "data/realtime/${{ steps.vars.outputs.DATE }}" | sed -n '1,50p'
+          ls -lh "data/realtime/${{ steps.vars.outputs.DATE }}" | sed -n '1,80p'
           echo "Starting build_master…"
           python pollers/build_master.py
 
       - name: Upload curated partition as artifact
+        timeout-minutes: 10
         uses: actions/upload-artifact@v4
         with:
           name: curated_backfill_${{ steps.vars.outputs.DATE }}
@@ -166,7 +170,7 @@ jobs:
             data/curated/service_date=${{ steps.vars.outputs.DATE }}/**
           retention-days: 30
 
-      # Optional: push to Google Drive to keep history
+      # Optional: push curated history to Google Drive
       - name: Install rclone
         run: curl -fsSL https://rclone.org/install.sh | sudo bash
 
@@ -179,6 +183,7 @@ jobs:
 
       - name: Sync curated to Drive (optional)
         if: ${{ env.RCLONE_CONF_B64 != '' }}
+        timeout-minutes: 15
         run: |
           rclone copy data/curated googledrive:penn-station/curated \
             --create-empty-src-dirs --checksum --transfers=4 --checkers=8
