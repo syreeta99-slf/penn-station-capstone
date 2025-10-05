@@ -151,8 +151,9 @@ jobs:
           TRANSFER_WINDOW_MIN: ${{ inputs.transfer_window_min }}
           MISSED_THRESHOLD_MIN: ${{ inputs.missed_threshold_min }}
         run: |
-          echo "RT files:"
-          ls -lh "data/realtime/${{ steps.vars.outputs.DATE }}" | sed -n '1,80p'
+          set -euo pipefai
+          echo "RT files:"; ls -lh "data/realtime/${{ steps.vars.outputs.DATE }}" | sed -n '1,80p'
+          trap 'echo "::warning:: Received SIGTERM at $(date -u). Runner likely canceled the step."' TERM
           echo "Starting build_master…"
           python pollers/build_master.py
 
