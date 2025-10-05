@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 import io, json, zipfile
 import pandas as pd
 import subprocess, sys
-import os
+import time, os
 
 # ----------------------- PATHS -----------------------
 DATA_DIR = Path("data")
@@ -32,6 +32,7 @@ STATIC_DIR = Path("gtfs_static")
 CONFIG_PATH = Path("config/penn_stops.json")
 
 CURATED_DIR.mkdir(parents=True, exist_ok=True)
+ALLOW_STATIC_REFRESH = os.getenv("ALLOW_STATIC_REFRESH", "1")
 
 # -------------------- PARAMETERS ---------------------
 # Interface pairing thresholds
@@ -110,11 +111,13 @@ def parse_gtfs_time_to_dt(hms: str, service_date: str) -> pd.Timestamp:
 def latest_static_zip() -> Path:
     zips = sorted(STATIC_DIR.glob("subway_all_*.zip")) or sorted(STATIC_DIR.glob("subway_all*.zip"))
     if not zips:
-        print("[build_master] No static ZIPs found in gtfs_static/. Attempting one-time refresh...")
+        if ALLOW_STATIC_REFRESH != "1":
+            raise FileNotFoundError("No static ZIPs in gtfs_static/. Set ALLOW_STATIC_REFRESH=1 or pre-seed cache.")
+        print("[build_master] No static ZIPs found. Attempting refresh…", flush=True)
         subprocess.check_call([sys.executable, "pollers/mta_static_refresh.py"])
         zips = sorted(STATIC_DIR.glob("subway_all_*.zip")) or sorted(STATIC_DIR.glob("subway_all*.zip"))
         if not zips:
-            raise FileNotFoundError("Static refresh ran but no subway_all_*.zip present in gtfs_static/.")
+            raise FileNotFoundError("Static refresh ran but no subway_all_*.zip present.")
     return zips[-1]
 
 
@@ -589,11 +592,27 @@ def main():
     if not penn_ids:
         raise RuntimeError("'subway_penn_stops' is empty in config/penn_stops.json")
 
-    # Load inputs
+ 
+    # Load inputs with timing
+    t0 = time.perf_counter()
     rt = load_realtime_events()
+    print(f"[t] load_realtime_events: {(time.perf_counter()-t0):.1f}s", flush=True)
+    
     service_date = infer_service_date_from_rt(rt)
     if SERVICE_DATE_OVERRIDE:
         service_date = SERVICE_DATE_OVERRIDE
+
+    t1 = time.perf_counter()
+    sched = load_scheduled_at_penn(service_date, penn_ids)
+    print(f"[t] load_scheduled_at_penn: {(time.perf_counter()-t1):.1f}s", flush=True)
+
+    t2 = time.perf_counter()
+    events_at_penn = join_static_with_rt_time_based(sched, rt, tolerance_min=30)
+    print(f"[t] join_static_with_rt_time_based: {(time.perf_counter()-t2):.1f}s", flush=True)
+
+    t3 = time.perf_counter()
+    interfaces = build_interfaces_123_ace(events_at_penn)
+    print(f"[t] build_interfaces_123_ace: {(time.perf_counter()-t3):.1f}s", flush=True)
 
     print(f"[build_master] Using service_date: {service_date}")
 
