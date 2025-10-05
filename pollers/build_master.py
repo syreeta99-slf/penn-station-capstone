@@ -656,6 +656,8 @@ def main():
     interfaces = build_interfaces_123_ace(events_at_penn)
     interfaces = add_time_features(interfaces)
     interfaces = add_placeholders_and_scores(interfaces)
+    # Build aggregated table
+    agg = build_interface_agg(interfaces)
 
     # ---------- QC Diagnostics (before final save) ----------
     print("\n[qc] Interfaces by link:")
@@ -700,6 +702,16 @@ def main():
         "Transfer_Gap_Min","Missed_Transfer_Flag"
     ]])
 
+    summary = {
+    "service_date": service_date,
+    "rows": int(len(interfaces)),
+    "missed_rate": (float(interfaces["Missed_Transfer_Flag"].mean(skipna=True))
+                    if "Missed_Transfer_Flag" in interfaces.columns and len(interfaces) else None),
+    "by_link": (interfaces.groupby(["From_Node","To_Node"]).size().to_dict()
+                if len(interfaces) else {}),
+    "generated_at_utc": datetime.utcnow().isoformat() + "Z",
+}
+ 
     # ---------- De-dup the interface rows ----------
     before_if = len(interfaces)
     interfaces = interfaces.drop_duplicates(subset=[
@@ -727,7 +739,7 @@ def main():
         if c not in interfaces.columns:
             interfaces[c] = pd.NA
     interfaces = interfaces[cols]
-
+    
     #Save outputs
     out_csv = CURATED_DIR / "master_interface_dataset.csv"
     out_parq = CURATED_DIR / "master_interface_dataset.parquet"
@@ -756,8 +768,13 @@ def main():
         "transfer_window_min": TRANSFER_WINDOW_MIN,
         "missed_threshold_min": MISSED_THRESHOLD_MIN,
     }
+    # snapshot summary (latest only)
     pd.Series(summary).to_json(CURATED_DIR / "master_interface_dataset_summary.json", indent=2)
-    print(f"[build_master] Wrote run summary → {CURATED_DIR/'master_interface_dataset_summary.json'}")
+    print(f"[build_master] Wrote snapshot summary → {CURATED_DIR/'master_interface_dataset_summary.json'}")
+
+    # partitioned summary (kept per day)
+    pd.Series(summary).to_json(part_dir / "master_interface_dataset_summary.json", indent=2)
+    print(f"[build_master] Wrote partitioned outputs → {part_dir}")
 
 
 if __name__ == "__main__":
