@@ -105,11 +105,11 @@ def build_stop_alias_map(stops_df: pd.DataFrame) -> dict:
 
 # ------------------- LOAD INPUTS ---------------------
 def load_realtime_events() -> pd.DataFrame:
-    files = sorted(REALTIME_DIR.glob("subway_rt_*.csv"))
+    files = sorted(RT_DIR.glob("subway_rt_*.csv"))
     if not files:
         raise FileNotFoundError("No realtime CSVs in data/realtime/. Run the realtime poller first.")
     # last 60 files is a reasonable working window; adjust as you like
-    dfs = [pd.read_csv(f) for f in files[-60:]]
+    dfs = [pd.read_csv(f) for f in files[-RT_MAX_FILES:]]
     df = pd.concat(dfs, ignore_index=True)
 
     for col in ["rt_arrival_utc", "rt_departure_utc", "source_minute_utc"]:
@@ -554,6 +554,9 @@ def main():
     # Load inputs
     rt = load_realtime_events()
     service_date = infer_service_date_from_rt(rt)
+    if SERVICE_DATE_OVERRIDE:
+        service_date = SERVICE_DATE_OVERRIDE
+
     print(f"[build_master] Using service_date: {service_date}")
 
     sched = load_scheduled_at_penn(service_date, penn_ids)
@@ -693,6 +696,16 @@ def main():
     interfaces.to_csv(out_csv, index=False)
     interfaces.to_parquet(out_parq, index=False)
     print(f"[build_master] Wrote {len(interfaces)} rows → {out_csv} / {out_parq}")
+
+    part_dir = CURATED_DIR / f"service_date={service_date}"
+    part_dir.mkdir(parents=True, exist_ok=True)
+
+    interfaces.to_parquet(part_dir / "master_interface_dataset.parquet", index=False)
+    interfaces.to_csv(part_dir / "master_interface_dataset.csv", index=False)
+    agg.to_parquet(part_dir / "master_interface_agg.parquet", index=False)
+    pd.Series(summary).to_json(part_dir / "master_interface_dataset_summary.json", indent=2)
+
+    print(f"[build_master] Wrote partitioned outputs → {part_dir}")
 
     # Save a lightweight JSON summary for quick reference
     summary = {
