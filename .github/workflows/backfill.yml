@@ -110,12 +110,19 @@ jobs:
 
       # --------- NEW: cache & prime static GTFS so we don't refetch every run ----------
       - name: Cache GTFS static
+        id: gtfs_cache      
         uses: actions/cache@v4
         with:
           path: gtfs_static
           key: gtfs-static-v1
           restore-keys: |
             gtfs-static-
+            
+      - name: Show cache status & list gtfs_static
+        run: |
+          echo "cache-hit=${{ steps.gtfs_cache.outputs.cache-hit }}"
+          ls -lh gtfs_static || true
+          ls -lh gtfs_static/*.zip 2>/dev/null || echo "No static zips yet."      
 
       - name: Prime static GTFS if missing
         run: |
@@ -129,12 +136,18 @@ jobs:
 
       - name: Run build_master once on the merged folder
         env:
+          PYTHONUNBUFFERED: "1"             # stream logs live
+          ALLOW_STATIC_REFRESH: "0"         # don't silently refresh here
           RT_DIR: data/realtime/${{ steps.vars.outputs.DATE }}
           RT_MAX_FILES: "999999"
           SERVICE_DATE: ${{ steps.vars.outputs.DATE }}
           TRANSFER_WINDOW_MIN: ${{ inputs.transfer_window_min }}
           MISSED_THRESHOLD_MIN: ${{ inputs.missed_threshold_min }}
-        run: python pollers/build_master.py
+        run: |
+          echo "RT files:"
+          ls -lh "data/realtime/${{ steps.vars.outputs.DATE }}" | sed -n '1,50p'
+          echo "Starting build_master…"
+          python pollers/build_master.py
 
       - name: Upload curated partition as artifact
         uses: actions/upload-artifact@v4
