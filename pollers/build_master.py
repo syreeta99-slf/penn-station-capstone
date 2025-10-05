@@ -49,6 +49,44 @@ ROUTE_GROUPS = {
 }
 
 # -------------------- HELPERS ------------------------
+def build_interface_agg(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aggregate the event-level interfaces into a compact summary by link/time buckets.
+    Assumes the event-level frame already has:
+      - Missed_Transfer_Flag (bool)
+      - Transfer_Gap_Min (float)
+      - Arrival_Delay_Min_Filled, Departure_Delay_Min_Filled (floats; you already create these)
+      - Time_Period, Day_of_Week (added by add_time_features)
+    """
+    if df.empty:
+        cols = ["From_Node","To_Node","Link_Type","Time_Period","Day_of_Week",
+                "Events","Missed_Rate","Avg_Transfer_Gap","P50_Transfer_Gap","P90_Transfer_Gap",
+                "Avg_Arrival_Delay","Avg_Departure_Delay"]
+        return pd.DataFrame(columns=cols)
+
+    gcols = ["From_Node","To_Node","Link_Type","Time_Period","Day_of_Week"]
+    tmp = df.copy()
+
+    # Ensure numeric
+    for c in ["Transfer_Gap_Min","Arrival_Delay_Min_Filled","Departure_Delay_Min_Filled"]:
+        if c in tmp.columns:
+            tmp[c] = pd.to_numeric(tmp[c], errors="coerce")
+
+    agg = (
+        tmp.groupby(gcols, dropna=False)
+           .agg(
+               Events=("Interface_ID","count"),
+               Missed_Rate=("Missed_Transfer_Flag", lambda s: float(pd.Series(s).mean(skipna=True))),
+               Avg_Transfer_Gap=("Transfer_Gap_Min","mean"),
+               P50_Transfer_Gap=("Transfer_Gap_Min", lambda s: pd.Series(s).quantile(0.50)),
+               P90_Transfer_Gap=("Transfer_Gap_Min", lambda s: pd.Series(s).quantile(0.90)),
+               Avg_Arrival_Delay=("Arrival_Delay_Min_Filled","mean"),
+               Avg_Departure_Delay=("Departure_Delay_Min_Filled","mean"),
+           )
+           .reset_index()
+    )
+    return agg
+
 def route_to_node(route_id: str) -> str:
     if pd.isna(route_id) or route_id is None:
         return "Subway_Unknown"
