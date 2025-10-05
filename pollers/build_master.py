@@ -22,6 +22,12 @@ import os
 DATA_DIR = Path("data")
 REALTIME_DIR = DATA_DIR / "realtime"
 CURATED_DIR = DATA_DIR / "curated"
+
+# NEW: allow overriding the realtime folder & file count
+RT_DIR = Path(os.getenv("RT_DIR", str(REALTIME_DIR)))
+RT_MAX_FILES = int(os.getenv("RT_MAX_FILES", "60"))
+
+SERVICE_DATE_OVERRIDE = os.getenv("SERVICE_DATE", "").strip()
 STATIC_DIR = Path("gtfs_static")
 CONFIG_PATH = Path("config/penn_stops.json")
 
