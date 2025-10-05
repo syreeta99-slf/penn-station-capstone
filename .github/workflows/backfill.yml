@@ -13,14 +13,14 @@ on:
         required: true
         type: string
       artifact_name:
-        description: "Per-run realtime artifact name from pipeline (default matches pipeline.yml)"
+        description: "Per-run realtime artifact name from pipeline"
         required: true
         default: "subway_realtime_csvs"
         type: string
       source_workflow_filename:
         description: "Your main pipeline workflow filename in .github/workflows/"
         required: true
-        default: "pipeline.yml"  # set to your actual pipeline workflow filename
+        default: "pipeline.yml"
         type: string
       transfer_window_min:
         description: "Transfer window minutes"
@@ -40,6 +40,8 @@ jobs:
     permissions:
       contents: read
       actions: read
+    env:
+      RCLONE_CONF_B64: ${{ secrets.RCLONE_CONF_B64 }}
 
     steps:
       - uses: actions/checkout@v4
@@ -66,7 +68,7 @@ jobs:
           echo "START=${{ inputs.backfill_date }}T00:00:00Z" >> $GITHUB_OUTPUT
           echo "END=${{ inputs.backfill_date }}T23:59:59Z" >> $GITHUB_OUTPUT
 
-      # ---- Fast path: try the single per-day artifact first ----
+      # ---- Fast path: try single daily artifact ----
       - name: Try daily artifact fast-path
         id: daily
         timeout-minutes: 5
@@ -86,7 +88,7 @@ jobs:
             echo "found=false" >> $GITHUB_OUTPUT
           fi
 
-      # ---- Fallback: stitch individual per-run artifacts for that date ----
+      # ---- Fallback: stitch per-run artifacts ----
       - name: Find workflow id
         id: wf
         if: steps.daily.outputs.found == 'false'
@@ -148,6 +150,9 @@ jobs:
     permissions:
       contents: read
       actions: read
+    env:
+      # expose secret to job env so we can check env in if:
+      RCLONE_CONF_B64: ${{ secrets.RCLONE_CONF_B64 }}
 
     steps:
       - uses: actions/checkout@v4
@@ -165,7 +170,7 @@ jobs:
           name: rt_merged_${{ github.event.inputs.backfill_date }}
           path: data/realtime/${{ github.event.inputs.backfill_date }}
 
-      # Cache & prime static GTFS once here
+      # Cache & prime static GTFS
       - name: Cache GTFS static
         id: gtfs_cache
         uses: actions/cache@v4
@@ -194,8 +199,8 @@ jobs:
       - name: Run build_master once on the merged folder
         timeout-minutes: 40
         env:
-          PYTHONUNBUFFERED: "1"             # stream Python logs live
-          ALLOW_STATIC_REFRESH: "0"         # fail fast if static is missing
+          PYTHONUNBUFFERED: "1"             # stream logs live
+          ALLOW_STATIC_REFRESH: "0"         # fail fast if static missing here
           RT_DIR: data/realtime/${{ github.event.inputs.backfill_date }}
           RT_MAX_FILES: "999999"
           SERVICE_DATE: ${{ github.event.inputs.backfill_date }}
@@ -223,19 +228,19 @@ jobs:
             data/curated/service_date=${{ github.event.inputs.backfill_date }}/**
           retention-days: 30
 
-      # Optional: push curated history to Google Drive (requires RCLONE_CONF_B64 secret)
+      # Optional Drive sync (only runs if secret present)
       - name: Install rclone
         run: curl -fsSL https://rclone.org/install.sh | sudo bash
 
       - name: Write rclone.conf
-        if: ${{ secrets.RCLONE_CONF_B64 != '' }}
+        if: ${{ env.RCLONE_CONF_B64 != '' }}
         run: |
           mkdir -p ~/.config/rclone
-          echo "${{ secrets.RCLONE_CONF_B64 }}" | base64 -d > ~/.config/rclone/rclone.conf
+          echo "${RCLONE_CONF_B64}" | base64 -d > ~/.config/rclone/rclone.conf
           chmod 600 ~/.config/rclone/rclone.conf
 
       - name: Sync curated to Drive (optional)
-        if: ${{ secrets.RCLONE_CONF_B64 != '' }}
+        if: ${{ env.RCLONE_CONF_B64 != '' }}
         timeout-minutes: 15
         run: |
           rclone copy data/curated googledrive:penn-station/curated \
