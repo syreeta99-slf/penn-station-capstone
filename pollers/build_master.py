@@ -17,7 +17,7 @@ Append mode (if APPEND_TO_MASTER=1):
 from __future__ import annotations
 from pathlib import Path
 from datetime import datetime
-import os, io, json, zipfile, subprocess, sys, textwrap
+import os, io, json, zipfile, subprocess, sys
 
 import pandas as pd
 
@@ -33,15 +33,15 @@ CURATED_DIR.mkdir(parents=True, exist_ok=True)
 
 # Env knobs
 RT_DIR = Path(os.getenv("RT_DIR", str(REALTIME_DIR)))
-RT_MAX_FILES = int(os.getenv("RT_MAX_FILES", "60"))  # how many newest CSVs to consider (set big for backfill)
-SERVICE_DATE_OVERRIDE = os.getenv("SERVICE_DATE", "")  # YYYY-MM-DD or empty to infer from RT
+RT_MAX_FILES = int(os.getenv("RT_MAX_FILES", "60"))  # newest CSVs to consider
+SERVICE_DATE_OVERRIDE = os.getenv("SERVICE_DATE", "")  # YYYY-MM-DD or empty
 TRANSFER_WINDOW_MIN = int(os.getenv("TRANSFER_WINDOW_MIN", "20"))
 MISSED_THRESHOLD_MIN = float(os.getenv("MISSED_THRESHOLD_MIN", "2"))
 ALLOW_STATIC_REFRESH = os.getenv("ALLOW_STATIC_REFRESH", "1")
 APPEND_TO_MASTER = os.getenv("APPEND_TO_MASTER", "0") == "1"
 
-AM_PEAK = range(6, 10)          # 06–09 local
-PM_PEAK = range(16, 20)         # 16–19 local
+AM_PEAK = range(6, 10)   # 06–09 local
+PM_PEAK = range(16, 20)  # 16–19 local
 
 # Route → Node mapping (tune as needed)
 ROUTE_GROUPS = {
@@ -88,8 +88,7 @@ def read_txt_from_zip(zip_path: Path, member: str) -> pd.DataFrame:
 
 
 def infer_service_date_from_rt(rt_df: pd.DataFrame) -> str:
-    ts = pd.concat([rt_df.get("rt_arrival_utc"), rt_df.get("rt_departure_utc")], ignore_index=True)
-    ts = ts.dropna()
+    ts = pd.concat([rt_df.get("rt_arrival_utc"), rt_df.get("rt_departure_utc")], ignore_index=True).dropna()
     if ts.empty:
         return datetime.utcnow().date().isoformat()
     ts_local = ts.dt.tz_convert("America/New_York")
@@ -187,7 +186,6 @@ def _prep_for_asof(df: pd.DataFrame, ts_col: str, by_cols: list[str] | None = No
         for c in by_cols:
             df[c] = df[c].astype(str)
 
-    # normalize common columns we often see
     if "stop_id_norm" in df.columns:
         df["stop_id_norm"] = df["stop_id_norm"].astype(str)
     if "route_id" in df.columns:
@@ -197,7 +195,6 @@ def _prep_for_asof(df: pd.DataFrame, ts_col: str, by_cols: list[str] | None = No
     if not pd.api.types.is_datetime64_any_dtype(df[ts_col]):
         df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce", utc=True)
     else:
-        # if already datetime but naive, localize to UTC
         if getattr(df[ts_col].dtype, "tz", None) is None:
             df[ts_col] = pd.to_datetime(df[ts_col], utc=True)
 
@@ -208,9 +205,9 @@ def _prep_for_asof(df: pd.DataFrame, ts_col: str, by_cols: list[str] | None = No
     # STABLE lexicographic sort
     sort_cols = (by_cols or []) + [ts_col]
     df = df.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
-
     return df
-    
+
+
 def _is_lexsorted(df: pd.DataFrame, ts_col: str, by_cols: list[str] | None = None) -> bool:
     cols = (by_cols or []) + [ts_col]
     if not cols:
@@ -226,27 +223,22 @@ def _assert_sorted(df: pd.DataFrame, ts_col: str, by_cols: list[str] | None = No
     """Optional guard to fail fast with a clear message if sorting precondition breaks."""
     if df is None or df.empty:
         return
-    sort_cols = (by_cols or []) + [ts_col]
-    ok = True
     if by_cols:
-        # check groupwise monotonicity
         bad_groups = []
         for k, g in df.groupby(by_cols, dropna=False, sort=False):
             if not g[ts_col].is_monotonic_increasing:
                 bad_groups.append(k)
                 if len(bad_groups) >= 5:
                     break
-        ok = (len(bad_groups) == 0)
-        if not ok:
+        if bad_groups:
             raise ValueError(f"[asof-guard] {label}: time not sorted within groups for {ts_col}; bad groups (first 5): {bad_groups}")
     else:
         if not df[ts_col].is_monotonic_increasing:
             raise ValueError(f"[asof-guard] {label}: {ts_col} not globally sorted.")
 
+
 def _group_keys_intersection(left: pd.DataFrame, right: pd.DataFrame, by_cols: list[str]) -> pd.DataFrame:
-    """
-    Return a DataFrame of unique key tuples that exist in BOTH left and right.
-    """
+    """Return unique key tuples that exist in BOTH left and right."""
     if not by_cols:
         return pd.DataFrame({"_dummy": [1]})
     lkeys = left[by_cols].drop_duplicates()
@@ -270,30 +262,23 @@ def _groupwise_asof(
     This avoids pandas' global 'keys must be sorted' error because each mini-merge
     is trivially sorted on its own subset.
     """
-    # Early outs
     if left.empty or right.empty:
         return pd.DataFrame()
 
-    # Filter to key tuples that appear on BOTH sides
     keys = _group_keys_intersection(left, right, by_cols)
-
     out = []
-    # No grouping case: do a single group merge
+
     if not by_cols:
         l = left.sort_values([left_on], kind="mergesort").reset_index(drop=True)
         r = right.sort_values([right_on], kind="mergesort").reset_index(drop=True)
-        merged = pd.merge_asof(
+        return pd.merge_asof(
             l, r,
             left_on=left_on, right_on=right_on,
             direction=direction, tolerance=tolerance,
             allow_exact_matches=allow_exact_matches
         )
-        return merged
 
-    # Grouped case
-    # Iterate only over keys present in both
     for _, keyrow in keys.iterrows():
-        # Build mask per column (fast & explicit)
         lmask = pd.Series(True, index=left.index)
         rmask = pd.Series(True, index=right.index)
         for c in by_cols:
@@ -321,116 +306,84 @@ def _groupwise_asof(
         return pd.DataFrame(columns=list(set(left.columns) | set(right.columns)))
     return pd.concat(out, ignore_index=True)
 
+
 # -------------------- TIME-BASED MATCH --------------------
 def join_static_with_rt_time_based(sched_df: pd.DataFrame, rt_df: pd.DataFrame, tolerance_min: int = 30) -> pd.DataFrame:
     """
     Nearest-time join between realtime and scheduled stop events at Penn.
-    Uses merge_asof on both arrivals and departures, with multi-key group-aware sorting.
+    Uses groupwise merge_asof on arrivals & departures. Left=RT, right=Schedule.
     """
     tol = pd.Timedelta(minutes=tolerance_min)
 
-    # Columns present check (defensive)
-    for needed in [
-        "trip_id","stop_id","stop_id_norm","route_id",
-        "Scheduled_Arrival","Scheduled_Departure"
-    ]:
+    # Defensive column checks
+    for needed in ["trip_id","stop_id","stop_id_norm","route_id","Scheduled_Arrival","Scheduled_Departure"]:
         if needed not in sched_df.columns:
-            raise KeyError(f"[join] sched_df is missing required column: {needed}")
+            raise KeyError(f"[join] sched_df missing: {needed}")
 
     for needed in ["trip_id","stop_id","stop_id_norm","route_id","rt_arrival_utc","rt_departure_utc"]:
-        if needed not in rt_df.columns:
-            # allow missing arrivals or departures; we’ll handle empties
-            if needed in ("rt_arrival_utc","rt_departure_utc"):
-                continue
-            raise KeyError(f"[join] rt_df is missing required column: {needed}")
+        if needed not in rt_df.columns and needed not in ("rt_arrival_utc","rt_departure_utc"):
+            raise KeyError(f"[join] rt_df missing: {needed}")
 
-    # Build slim views
-    rtA = (rt_df[["trip_id","stop_id","stop_id_norm","route_id","rt_arrival_utc"]]
-           .rename(columns={"rt_arrival_utc":"RT_Arrival"}))
-    rtD = (rt_df[["trip_id","stop_id","stop_id_norm","route_id","rt_departure_utc"]]
-           .rename(columns={"rt_departure_utc":"RT_Departure"}))
+    # Build slim views (avoid _x/_y; only left carries IDs)
+    rtA_full = rt_df[["trip_id","stop_id","stop_id_norm","route_id","rt_arrival_utc"]].rename(columns={"rt_arrival_utc":"RT_Arrival"})
+    rtD_full = rt_df[["trip_id","stop_id","stop_id_norm","route_id","rt_departure_utc"]].rename(columns={"rt_departure_utc":"RT_Departure"})
+    schedA_full = sched_df[["stop_id_norm","route_id","Scheduled_Arrival"]]  # no IDs here
+    schedD_full = sched_df[["stop_id_norm","route_id","Scheduled_Departure"]]
 
-    schedA = sched_df[["trip_id","stop_id","stop_id_norm","route_id","Scheduled_Arrival"]].copy()
-    schedD = sched_df[["trip_id","stop_id","stop_id_norm","route_id","Scheduled_Departure"]].copy()
-
-    # Choose grouping keys that exist on both sides (stable & specific first)
+    # Choose grouping keys present on both sides
     candidate_by = ["stop_id_norm", "route_id"]
-    by_cols = [c for c in candidate_by if c in sched_df.columns and c in rt_df.columns]
+    by_cols = [c for c in candidate_by if c in schedA_full.columns and c in rtA_full.columns]
 
-    print(f"[join] by_cols={by_cols}  rtA={len(rtA)}  schedA={len(schedA)}  rtD={len(rtD)}  schedD={len(schedD)}")
+    # Debug
+    print(f"[join] by_cols={by_cols}  rtA={len(rtA_full)}  schedA={len(schedA_full)}  rtD={len(rtD_full)}  schedD={len(schedD_full)}")
 
-    # Prepare both sides (casts, drops, sorts)
-    rtA = _prep_for_asof(rtA, "RT_Arrival", by_cols)
-    rtD = _prep_for_asof(rtD, "RT_Departure", by_cols)
-    schedA = _prep_for_asof(schedA, "Scheduled_Arrival", by_cols)
-    schedD = _prep_for_asof(schedD, "Scheduled_Departure", by_cols)
+    # Prepare both sides (casts, drops, stable sort)
+    rtA = _prep_for_asof(rtA_full, "RT_Arrival", by_cols)
+    rtD = _prep_for_asof(rtD_full, "RT_Departure", by_cols)
+    schedA = _prep_for_asof(schedA_full, "Scheduled_Arrival", by_cols)
+    schedD = _prep_for_asof(schedD_full, "Scheduled_Departure", by_cols)
 
-    # Optional sanity guards (clear fail if preconditions break)
+    # Guards
     _assert_sorted(rtA, "RT_Arrival", by_cols, label="rtA")
     _assert_sorted(schedA, "Scheduled_Arrival", by_cols, label="schedA")
     _assert_sorted(rtD, "RT_Departure", by_cols, label="rtD")
     _assert_sorted(schedD, "Scheduled_Departure", by_cols, label="schedD")
 
-    # HARD guards to fail with a clear message BEFORE merge_asof
     if not _is_lexsorted(rtA, "RT_Arrival", by_cols):
-        # optional: dump first few offending rows for debugging
-        print("[guard] rtA not lexsorted by", by_cols + ["RT_Arrival"])
-        print(rtA[by_cols + ["RT_Arrival"]].head(15))
-        raise ValueError("rtA left keys must be lexsorted by by_cols then RT_Arrival")
-
+        raise ValueError("rtA not lexsorted by by_cols + RT_Arrival")
     if not _is_lexsorted(schedA, "Scheduled_Arrival", by_cols):
-        print("[guard] schedA not lexsorted by", by_cols + ["Scheduled_Arrival"])
-        print(schedA[by_cols + ["Scheduled_Arrival"]].head(15))
-        raise ValueError("schedA right keys must be lexsorted by by_cols then Scheduled_Arrival")
-
+        raise ValueError("schedA not lexsorted by by_cols + Scheduled_Arrival")
     if not _is_lexsorted(rtD, "RT_Departure", by_cols):
-        print("[guard] rtD not lexsorted by", by_cols + ["RT_Departure"])
-        print(rtD[by_cols + ["RT_Departure"]].head(15))
-        raise ValueError("rtD left keys must be lexsorted by by_cols then RT_Departure")
-
+        raise ValueError("rtD not lexsorted by by_cols + RT_Departure")
     if not _is_lexsorted(schedD, "Scheduled_Departure", by_cols):
-        print("[guard] schedD not lexsorted by", by_cols + ["Scheduled_Departure"])
-        print(schedD[by_cols + ["Scheduled_Departure"]].head(15))
-        raise ValueError("schedD right keys must be lexsorted by by_cols then Scheduled_Departure")
+        raise ValueError("schedD not lexsorted by by_cols + Scheduled_Departure")
 
-    # EXTRA: make sure the time dtypes match left/right (tz-aware UTC on both sides)
-    if (rtA["RT_Arrival"].dtype != schedA["Scheduled_Arrival"].dtype) and (not rtA.empty and not schedA.empty):
-        raise TypeError(f"dtype mismatch on arrival keys: {rtA['RT_Arrival'].dtype} vs {schedA['Scheduled_Arrival'].dtype}")
+    # Groupwise asof (left=RT, right=Schedule)
+    # Arrival: keep IDs only on left to avoid suffix mess
+    leftA = rtA[by_cols + ["RT_Arrival","trip_id","stop_id","stop_id_norm","route_id"]].rename(
+        columns={"trip_id":"trip_id_arr","stop_id":"stop_id_arr","route_id":"route_id_arr"}
+    )
+    rightA = schedA[by_cols + ["Scheduled_Arrival"]]
 
-    if (rtD["RT_Departure"].dtype != schedD["Scheduled_Departure"].dtype) and (not rtD.empty and not schedD.empty):
-        raise TypeError(f"dtype mismatch on departure keys: {rtD['RT_Departure'].dtype} vs {schedD['Scheduled_Departure'].dtype}")
+    a = _groupwise_asof(
+        left=leftA, right=rightA,
+        left_on="RT_Arrival", right_on="Scheduled_Arrival",
+        by_cols=by_cols, tolerance=tol, direction="nearest", allow_exact_matches=True
+    ) if not (leftA.empty or rightA.empty) else pd.DataFrame()
 
+    # Departure
+    leftD = rtD[by_cols + ["RT_Departure","trip_id","stop_id","stop_id_norm","route_id"]].rename(
+        columns={"trip_id":"trip_id_dep","stop_id":"stop_id_dep","route_id":"route_id_dep"}
+    )
+    rightD = schedD[by_cols + ["Scheduled_Departure"]]
 
-    # Groupwise asof merges (left = RT)
-    if rtA.empty or schedA.empty:
-        a = pd.DataFrame()
-    else:
-        a = _groupwise_asof(
-            left=rtA,
-            right=schedA,
-            left_on="RT_Arrival",
-            right_on="Scheduled_Arrival",
-            by_cols=by_cols or [],
-            tolerance=tol,
-            direction="nearest",
-            allow_exact_matches=True,
-        )
+    d = _groupwise_asof(
+        left=leftD, right=rightD,
+        left_on="RT_Departure", right_on="Scheduled_Departure",
+        by_cols=by_cols, tolerance=tol, direction="nearest", allow_exact_matches=True
+    ) if not (leftD.empty or rightD.empty) else pd.DataFrame()
 
-    if rtD.empty or schedD.empty:
-        d = pd.DataFrame()
-    else:
-        d = _groupwise_asof(
-            left=rtD,
-            right=schedD,
-            left_on="RT_Departure",
-            right_on="Scheduled_Departure",
-            by_cols=by_cols or [],
-            tolerance=tol,
-            direction="nearest",
-            allow_exact_matches=True,
-        )
-
-    # If both were empty, return a coherent empty schema
+    # If both empty, return coherent schema
     if a.empty and d.empty:
         return pd.DataFrame(columns=[
             "trip_id","route_id","stop_id","stop_id_norm",
@@ -438,41 +391,25 @@ def join_static_with_rt_time_based(sched_df: pd.DataFrame, rt_df: pd.DataFrame, 
             "Scheduled_Departure","RT_Departure","Departure_Delay_Min"
         ])
 
-    # Build combined view.
     # ----------------- Combine arrivals & departures robustly -----------------
-    # Decide join keys conservatively: prefer by_cols + trip_id; fall back as needed
-    candidate_keys = (by_cols or []) + ["trip_id", "stop_id_norm", "route_id", "stop_id"]
-    merge_keys = [k for k in candidate_keys if (k in a.columns) and (k in d.columns)]
-
-    # If nothing overlaps, create a synthetic key to let us outer-merge row-wise
+    # Prefer by_cols for merge keys
+    merge_keys = [k for k in (by_cols or []) if (k in a.columns) and (k in d.columns)]
     if not merge_keys:
-        if not a.empty:
-            a = a.copy()
-            a["_row_a"] = range(len(a))
-        if not d.empty:
-            d = d.copy()
-            d["_row_d"] = range(len(d))
-        # still no common key? fabricate a constant key so we can outer-merge
-        a["_const"] = 1
-        d["_const"] = 1
+        # last resort; should not happen with the slim frames above
+        if not a.empty: a = a.copy(); a["_const"] = 1
+        if not d.empty: d = d.copy(); d["_const"] = 1
         merge_keys = ["_const"]
-        
+
     print(f"[combine] merge_keys={merge_keys}  a_cols={list(a.columns)[:8]}...  d_cols={list(d.columns)[:8]}...")
 
-    out = pd.merge(
-        a, d,
-        on=merge_keys,
-        how="outer",
-        suffixes=("_arr", "_dep"),
-        copy=False
-    )
+    out = pd.merge(a, d, on=merge_keys, how="outer", suffixes=("_arr","_dep"), copy=False)
 
-    # Ensure expected columns exist (arrival/departure names)
+    # Ensure arrival/departure timestamp columns exist
     for col in ["Scheduled_Arrival","RT_Arrival","Scheduled_Departure","RT_Departure"]:
         if col not in out.columns:
             out[col] = pd.NaT
 
-    # Unify core ID columns (prefer arrival-side, then departure-side)
+    # Coalesce IDs
     def _coalesce(cols):
         ser = pd.Series(pd.NA, index=out.index, dtype="object")
         for c in cols:
@@ -483,12 +420,10 @@ def join_static_with_rt_time_based(sched_df: pd.DataFrame, rt_df: pd.DataFrame, 
     out["trip_id"]  = _coalesce(["trip_id_arr", "trip_id_dep", "trip_id"])
     out["route_id"] = _coalesce(["route_id_arr","route_id_dep","route_id"])
     out["stop_id"]  = _coalesce(["stop_id_arr","stop_id_dep","stop_id"])
-
-    # If stop_id_norm is available on either side, keep it
     if "stop_id_norm" not in out.columns:
-        out["stop_id_norm"] = _coalesce(["stop_id_norm_arr","stop_id_norm_dep","stop_id_norm"])
+        out["stop_id_norm"] = _coalesce(["stop_id_norm"])  # present via by_cols
 
-    # Compute delays safely
+    # Delays
     out["Arrival_Delay_Min"] = (
         pd.to_datetime(out["RT_Arrival"], utc=True, errors="coerce")
         - pd.to_datetime(out["Scheduled_Arrival"], utc=True, errors="coerce")
@@ -504,12 +439,11 @@ def join_static_with_rt_time_based(sched_df: pd.DataFrame, rt_df: pd.DataFrame, 
         "Scheduled_Arrival","RT_Arrival","Arrival_Delay_Min",
         "Scheduled_Departure","RT_Departure","Departure_Delay_Min"
     ]
-    # add any missing expected columns
     for c in keep:
         if c not in out.columns:
             out[c] = pd.NA
-
     out = out[keep]
+    return out  # <<< IMPORTANT
 
 
 # --------------- INTERFACE CONSTRUCTION -------------------
@@ -590,8 +524,7 @@ def build_interfaces_123_ace(events_df: pd.DataFrame) -> pd.DataFrame:
             "Used_Scheduled_Fallback": bool(a["Used_Scheduled_Fallback"])
         })
 
-    out = pd.DataFrame(out_rows)
-    return out
+    return pd.DataFrame(out_rows)
 
 
 # ---------------- TIME FEATURES & FIELDS ------------------
@@ -602,7 +535,6 @@ def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
                      .combine_first(df["Scheduled_Departure"]))
     when_local = pd.to_datetime(when, utc=True).dt.tz_convert("America/New_York")
 
-    df["Day_of_World"] = when_local.dt.day_name()   # (typo-proofing kept original name below too)
     df["Day_of_Week"] = when_local.dt.day_name()
     df["Hour_of_Day"] = when_local.dt.hour
     df["Peak_Flag"] = df["Hour_of_Day"].isin(list(AM_PEAK) + list(PM_PEAK))
@@ -688,8 +620,7 @@ def main():
 
     # Persist raw join for debug (optional)
     try:
-        (CURATED_DIR / "_debug_events_at_penn.csv").write_text(
-            events_at_penn.to_csv(index=False))
+        (CURATED_DIR / "_debug_events_at_penn.csv").write_text(events_at_penn.to_csv(index=False))
     except Exception:
         pass
 
@@ -738,7 +669,6 @@ def main():
         print("\n[qc] Missed-transfer rate:")
         print(f"Missed_Transfer_Flag rate: {miss_rate:.1%}")
 
-        # tiny sample
         print("\n[qc] Sample:")
         print(interfaces.head(5)[["Interface_ID","From_Node","To_Node","RT_Arrival","RT_Departure","Transfer_Gap_Min","Missed_Transfer_Flag"]])
 
