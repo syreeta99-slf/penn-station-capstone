@@ -132,14 +132,14 @@ jobs:
         run: curl -fsSL https://rclone.org/install.sh | sudo bash
 
       - name: Write rclone.conf
-        if: ${{ secrets.RCLONE_CONF_B64 != '' }}
+        if: ${{ env.RCLONE_CONF_B64 != '' }}
         run: |
           mkdir -p ~/.config/rclone
-          echo "${{ secrets.RCLONE_CONF_B64 }}" | base64 -d > ~/.config/rclone/rclone.conf
+          echo "${RCLONE_CONF_B64}" | base64 -d > ~/.config/rclone/rclone.conf
           chmod 600 ~/.config/rclone/rclone.conf
 
       - name: Sync curated to Drive (optional)
-        if: ${{ secrets.RCLONE_CONF_B64 != '' }}
+        if: ${{ env.RCLONE_CONF_B64 != '' }}
         run: |
           rclone copy data/curated googledrive:penn-station/curated \
             --create-empty-src-dirs --checksum --transfers=4 --checkers=8
