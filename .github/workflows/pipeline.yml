@@ -1,5 +1,9 @@
 name: MTA Subway Static + Realtime + Google Drive
 
+concurrency:
+  group: pipeline-${{ github.ref }}
+  cancel-in-progress: true  # ok for scheduled work, separate from backfill
+
 on:
   schedule:
     # Weekday peaks (America/New_York) with UTC buffers, every 10 minutes
