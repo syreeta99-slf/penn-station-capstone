@@ -1,5 +1,9 @@
 name: Backfill event-level dataset for a past date
 
+concurrency:
+  group: backfill-${{ github.ref }}-${{ inputs.backfill_date }}
+  cancel-in-progress: false
+
 on:
   workflow_dispatch:
     inputs:
