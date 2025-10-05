@@ -1,167 +1,126 @@
 name: MTA Subway Static + Realtime + Google Drive
 
+# Prevent scheduled runs from overlapping each other.
+# This group is DIFFERENT from backfill's group.
 concurrency:
   group: pipeline-${{ github.ref }}
-  cancel-in-progress: true  # ok for scheduled work, separate from backfill
+  cancel-in-progress: true
 
 on:
   schedule:
-    # Weekday peaks (America/New_York) with UTC buffers, every 10 minutes
-    - cron: "*/10 10-15 * * 1-5"   # AM 06:00–11:59 ET (covers DST switch)
-    - cron: "*/10 20-23 * * 1-5"   # PM 16:00–19:59 ET
-    - cron: "*/10 0-1 * * 1-5"     # PM 20:00–21:59 ET
-    # Weekend hourly coverage
-    - cron: "0 12-23 * * 6,0"   # Sat/Sun 08:00–19:00 ET
-    - cron: "0 0-2 * * 0,1"     # Sat/Sun 20:00–22:59 ET
-    - cron: "0 3-3 * * 0"         # 23:00 ET Sunday overlap (optional tidy-up hour)
-    # Weekly static refresh (Sun 03:10 UTC)
+    - cron: "*/10 10-15 * * 1-5"
+    - cron: "*/10 20-23 * * 1-5"
+    - cron: "*/10 0-1 * * 1-5"
+    - cron: "0 12-23 * * 6,0"
+    - cron: "0 0-2 * * 0,1"
     - cron: "10 3 * * 0"
-    
-  workflow_dispatch:
-    inputs:
-      run_static_refresh:
-        description: "Run GTFS static refresh now?"
-        type: boolean
-        default: false
-      transfer_window_min:
-        description: "Transfer window (minutes)"
-        required: true
-        default: "20"
-      missed_threshold_min:
-        description: "Missed threshold (minutes)"
-        required: true
-        default: "2"
+  workflow_dispatch: {}
 
 jobs:
   pipeline:
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
+    env:
+      # Optional: Drive sync (only used if you add rclone steps here later)
+      RCLONE_CONF_B64: ${{ secrets.RCLONE_CONF_B64 }}
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v4
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install deps
         run: pip install -r requirements.txt
 
-      # Resolve thresholds for BOTH cron and manual runs (with defaults)
-      - name: Resolve threshold env vars
+      - name: Install jq/unzip
         run: |
-          TW="${{ github.event.inputs.transfer_window_min }}"
-          MT="${{ github.event.inputs.missed_threshold_min }}"
-          # Defaults if inputs are empty (e.g., on scheduled runs)
-          [ -z "$TW" ] && TW=20
-          [ -z "$MT" ] && MT=2
-          echo "TRANSFER_WINDOW_MIN=$TW" >> "$GITHUB_ENV"
-          echo "MISSED_THRESHOLD_MIN=$MT" >> "$GITHUB_ENV"
-          echo "Resolved TRANSFER_WINDOW_MIN=$TW, MISSED_THRESHOLD_MIN=$MT"
+          sudo apt-get update -y
+          sudo apt-get install -y jq unzip
 
-      # Refresh GTFS static weekly (cron) OR when manually requested via the checkbox
-      - name: Refresh GTFS static (weekly or manual)
-        if: >
-          (github.event_name == 'schedule' && github.event.schedule == '10 3 * * 0') ||
-          (github.event_name == 'workflow_dispatch' && inputs.run_static_refresh == true)
-        run: python pollers/mta_static_refresh.py
-
-      # Ensure at least one static ZIP exists (auto-run refresh if missing)
-      - name: Ensure static GTFS exists
+      # ---- Realtime poller (your existing step) ----
+      - name: Run realtime poller
+        timeout-minutes: 10
+        env:
+          PYTHONUNBUFFERED: "1"
         run: |
-          set -e
-          if ls gtfs_static/subway_all_*.zip 1> /dev/null 2>&1; then
-            echo "Static GTFS found:"
-            ls -lh gtfs_static/subway_all_*.zip | tail -n 3
-          else
-            echo "No static GTFS found. Running static refresh..."
-            python pollers/mta_static_refresh.py
-            echo "Downloaded static:"
-            ls -lh gtfs_static
-          fi
+          trap 'echo "[signal] SIGTERM during realtime poller"; exit 143' SIGTERM
+          # Adjust to your entrypoint as needed:
+          python pollers/subway_realtime.py
 
-      # Pull realtime (protobuf) every run (creates data/realtime/subway_rt_*.csv)
-      - name: Poll MTA Subway realtime
-        run: |
-          mkdir -p data/realtime
-          python pollers/mta_realtime_subway.py
-          echo "Latest realtime CSVs:"
-          ls -lh data/realtime | tail -n 5
-
-      # Optional: peek at latest realtime stop_ids (diagnostic)
-      - name: Debug unique stop_ids
-        run: |
-          python - <<'EOF'
-          import pandas as pd, glob
-          files = sorted(glob.glob("data/realtime/*.csv"))
-          if files:
-              df = pd.read_csv(files[-1])
-              print("Unique stop_ids in latest CSV:", sorted(df["stop_id"].dropna().unique().tolist())[:25])
-              print("Example rows:\n", df.head(5))
-          else:
-              print("No realtime CSVs found.")
-          EOF
-
-      # Build curated master (uses latest static ZIP + realtime)
-      # Picks up TRANSFER_WINDOW_MIN and MISSED_THRESHOLD_MIN from $GITHUB_ENV
-      - name: Build Master dataset
-        run: python pollers/build_master.py
-
-      - name: Upload debug joined events (artifact)
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug_events_at_penn
-          path: data/curated/_debug_events_at_penn.csv
-          retention-days: 5
-
-      # Upload the realtime CSVs for inspection
-      - name: Upload realtime CSV artifact
+      # ---- Per-run RT artifact (used by backfill fallback) ----
+      - name: Upload per-run realtime artifact
+        timeout-minutes: 5
         uses: actions/upload-artifact@v4
         with:
           name: subway_realtime_csvs
           path: data/realtime/*.csv
           retention-days: 7
 
-      - name: Upload master dataset artifact
+      # ---- Single DAILY artifact (fast path for backfill) ----
+      - name: Compute DATE in ET
+        run: echo "DATE=$(TZ=America/New_York date +%F)" >> $GITHUB_ENV
+
+      - name: Consolidate today's realtime CSVs
+        timeout-minutes: 5
+        run: |
+          mkdir -p "data/realtime/${DATE}"
+          cp -n data/realtime/subway_rt_*.csv "data/realtime/${DATE}/" || true
+          ls -lh "data/realtime/${DATE}" || true
+
+      - name: Publish per-day merged artifact
+        timeout-minutes: 5
         uses: actions/upload-artifact@v4
         with:
-          name: master_interface_dataset
+          name: rt_day_${{ env.DATE }}
+          path: data/realtime/${{ env.DATE }}/
+          retention-days: 7
+
+      # ---- Optional: build master here, too ----
+      - name: Cache GTFS static
+        id: gtfs_cache
+        uses: actions/cache@v4
+        with:
+          path: gtfs_static
+          key: gtfs-static-v1
+          restore-keys: |
+            gtfs-static-
+
+      - name: Prime static GTFS if missing
+        timeout-minutes: 10
+        run: |
+          if ls gtfs_static/subway_all_*.zip 1>/dev/null 2>&1; then
+            echo "Static GTFS already present."
+          else
+            echo "Refreshing static GTFS…"
+            python pollers/mta_static_refresh.py
+          fi
+
+      - name: Run build_master (optional)
+        timeout-minutes: 30
+        env:
+          PYTHONUNBUFFERED: "1"
+          ALLOW_STATIC_REFRESH: "0"
+          TRANSFER_WINDOW_MIN: "20"
+          MISSED_THRESHOLD_MIN: "2"
+        run: |
+          trap 'echo "[signal] SIGTERM during build_master"; exit 143' SIGTERM
+          python pollers/build_master.py
+
+      - name: Upload curated (optional)
+        timeout-minutes: 5
+        uses: actions/upload-artifact@v4
+        with:
+          name: curated_today
           path: |
             data/curated/master_interface_dataset.csv
             data/curated/master_interface_dataset.parquet
+            data/curated/master_interface_agg.csv
+            data/curated/master_interface_agg.parquet
             data/curated/master_interface_dataset_summary.json
-          retention-days: 14
+          retention-days: 7
 
-      # --- Upload to Google Drive via rclone ---
-      - name: Ensure curated folder exists
-        run: mkdir -p data/curated
-
-      - name: Install rclone
-        run: curl -fsSL https://rclone.org/install.sh | sudo bash
-
-      - name: Write rclone.conf from Base64 secret
-        run: |
-          mkdir -p ~/.config/rclone
-          echo "${{ secrets.RCLONE_CONF_B64 }}" | base64 -d > ~/.config/rclone/rclone.conf
-          chmod 600 ~/.config/rclone/rclone.conf
-
-      - name: Verify rclone remote
-        run: |
-          rclone listremotes
-          rclone lsd googledrive: || (echo "Remote 'googledrive' not found; check your remote name and secret" && exit 1)
-
-      - name: Upload curated dataset to Google Drive
-        run: |
-          if [ -z "$(ls -A data/curated || true)" ]; then
-            echo "Nothing to upload yet (data/curated is empty)."
-          else
-            rclone copy data/curated googledrive:penn-station/curated \
-              --create-empty-src-dirs --checksum --transfers=4 --checkers=8
-          fi
-
-      - name: Upload curated artifacts (all)
-        uses: actions/upload-artifact@v4
-        with:
-          name: curated_${{ github.run_id }}
-          path: data/curated/*
-          retention-days: 30
