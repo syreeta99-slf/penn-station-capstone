@@ -439,46 +439,64 @@ def join_static_with_rt_time_based(sched_df: pd.DataFrame, rt_df: pd.DataFrame, 
         ])
 
     # Build combined view.
-    # Start from union of keys seen in either frame (on the chosen by_cols).
-    if by_cols:
-        base_keys = list(by_cols)
-    else:
-        base_keys = ["stop_id_norm"] if "stop_id_norm" in (a.columns if not a.empty else d.columns) else []
+    # ----------------- Combine arrivals & departures robustly -----------------
+    # Decide join keys conservatively: prefer by_cols + trip_id; fall back as needed
+    candidate_keys = (by_cols or []) + ["trip_id", "stop_id_norm", "route_id", "stop_id"]
+    merge_keys = [k for k in candidate_keys if (k in a.columns) and (k in d.columns)]
 
-    if base_keys:
-        base = pd.concat(
-            [
-                a[base_keys] if not a.empty else pd.DataFrame(columns=base_keys),
-                d[base_keys] if not d.empty else pd.DataFrame(columns=base_keys),
-            ],
-            ignore_index=True,
-        ).drop_duplicates()
-    else:
-        # fallback: simple single-row base to outer-merge into
-        base = pd.DataFrame({"_join_base": [1]})
+    # If nothing overlaps, create a synthetic key to let us outer-merge row-wise
+    if not merge_keys:
+        if not a.empty:
+            a = a.copy()
+            a["_row_a"] = range(len(a))
+        if not d.empty:
+            d = d.copy()
+            d["_row_d"] = range(len(d))
+        # still no common key? fabricate a constant key so we can outer-merge
+        a["_const"] = 1
+        d["_const"] = 1
+        merge_keys = ["_const"]
+        
+    print(f"[combine] merge_keys={merge_keys}  a_cols={list(a.columns)[:8]}...  d_cols={list(d.columns)[:8]}...")
 
-    out = base
-    if not a.empty:
-        out = out.merge(a, on=base_keys, how="left") if base_keys else out.merge(a, left_on="_join_base", right_index=True, how="left")
-    if not d.empty:
-        out = out.merge(d, on=base_keys, how="left", suffixes=("_arr","_dep")) if base_keys else out.merge(d, left_on="_join_base", right_index=True, suffixes=("_arr","_dep"), how="left")
+    out = pd.merge(
+        a, d,
+        on=merge_keys,
+        how="outer",
+        suffixes=("_arr", "_dep"),
+        copy=False
+    )
 
-    # Ensure expected columns exist
-    for c in ["trip_id_arr","stop_id_arr","route_id_arr","trip_id_dep","stop_id_dep","route_id_dep",
-              "Scheduled_Arrival","RT_Arrival","Scheduled_Departure","RT_Departure"]:
-        if c not in out.columns:
-            out[c] = pd.NA
+    # Ensure expected columns exist (arrival/departure names)
+    for col in ["Scheduled_Arrival","RT_Arrival","Scheduled_Departure","RT_Departure"]:
+        if col not in out.columns:
+            out[col] = pd.NaT
 
-    out["trip_id"] = out.get("trip_id_arr").combine_first(out.get("trip_id_dep"))
-    out["route_id"] = out.get("route_id_arr").combine_first(out.get("route_id_dep"))
-    out["stop_id"]  = out.get("stop_id_arr").combine_first(out.get("stop_id_dep"))
+    # Unify core ID columns (prefer arrival-side, then departure-side)
+    def _coalesce(cols):
+        ser = pd.Series(pd.NA, index=out.index, dtype="object")
+        for c in cols:
+            if c in out.columns:
+                ser = ser.combine_first(out[c])
+        return ser
 
+    out["trip_id"]  = _coalesce(["trip_id_arr", "trip_id_dep", "trip_id"])
+    out["route_id"] = _coalesce(["route_id_arr","route_id_dep","route_id"])
+    out["stop_id"]  = _coalesce(["stop_id_arr","stop_id_dep","stop_id"])
+
+    # If stop_id_norm is available on either side, keep it
+    if "stop_id_norm" not in out.columns:
+        out["stop_id_norm"] = _coalesce(["stop_id_norm_arr","stop_id_norm_dep","stop_id_norm"])
+
+    # Compute delays safely
     out["Arrival_Delay_Min"] = (
-        pd.to_datetime(out["RT_Arrival"], utc=True) - pd.to_datetime(out["Scheduled_Arrival"], utc=True)
+        pd.to_datetime(out["RT_Arrival"], utc=True, errors="coerce")
+        - pd.to_datetime(out["Scheduled_Arrival"], utc=True, errors="coerce")
     ).dt.total_seconds() / 60.0
 
     out["Departure_Delay_Min"] = (
-        pd.to_datetime(out["RT_Departure"], utc=True) - pd.to_datetime(out["Scheduled_Departure"], utc=True)
+        pd.to_datetime(out["RT_Departure"], utc=True, errors="coerce")
+        - pd.to_datetime(out["Scheduled_Departure"], utc=True, errors="coerce")
     ).dt.total_seconds() / 60.0
 
     keep = [
@@ -486,7 +504,12 @@ def join_static_with_rt_time_based(sched_df: pd.DataFrame, rt_df: pd.DataFrame, 
         "Scheduled_Arrival","RT_Arrival","Arrival_Delay_Min",
         "Scheduled_Departure","RT_Departure","Departure_Delay_Min"
     ]
-    return out[keep]
+    # add any missing expected columns
+    for c in keep:
+        if c not in out.columns:
+            out[c] = pd.NA
+
+    out = out[keep]
 
 
 # --------------- INTERFACE CONSTRUCTION -------------------
