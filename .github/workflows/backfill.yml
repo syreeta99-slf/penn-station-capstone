@@ -34,6 +34,9 @@ jobs:
     permissions:
       contents: read
       actions: read
+    env:
+      # make the secret available as an env var for if: guards
+      RCLONE_CONF_B64: ${{ secrets.RCLONE_CONF_B64 }}
     steps:
       - uses: actions/checkout@v4
 
