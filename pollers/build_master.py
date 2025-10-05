@@ -172,30 +172,54 @@ def load_scheduled_at_penn(service_date: str, penn_stop_ids: list) -> pd.DataFra
 # -------------------- ASOF PREP / SORT --------------------
 def _prep_for_asof(df: pd.DataFrame, ts_col: str, by_cols: list[str] | None = None) -> pd.DataFrame:
     """
-    General-purpose preparation for pd.merge_asof:
-      - cast stop_id_norm to string if present (stable key shape)
-      - ensure ts_col is datetime
-      - drop rows with NaN/NaT in join keys
-      - sort by by_cols (if provided) THEN ts_col
+    Prepare for merge_asof:
+      - cast key columns to consistent dtypes (strings for 'by', UTC datetimes for ts)
+      - drop rows with NaN/NaT in any join key
+      - stable lexicographic sort by by_cols then ts_col
     """
     if df is None or df.empty:
         return df.copy() if df is not None else pd.DataFrame()
 
     df = df.copy()
 
+    # normalize 'by' columns to string to avoid mixed-type ordering weirdness
+    if by_cols:
+        for c in by_cols:
+            df[c] = df[c].astype(str)
+
+    # normalize common columns we often see
     if "stop_id_norm" in df.columns:
         df["stop_id_norm"] = df["stop_id_norm"].astype(str)
+    if "route_id" in df.columns:
+        df["route_id"] = df["route_id"].astype(str)
 
+    # ensure timestamp column is tz-aware UTC
     if not pd.api.types.is_datetime64_any_dtype(df[ts_col]):
         df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce", utc=True)
+    else:
+        # if already datetime but naive, localize to UTC
+        if getattr(df[ts_col].dtype, "tz", None) is None:
+            df[ts_col] = pd.to_datetime(df[ts_col], utc=True)
 
+    # drop rows missing any join keys
     drop_cols = (by_cols or []) + [ts_col]
     df = df.dropna(subset=drop_cols)
 
+    # STABLE lexicographic sort
     sort_cols = (by_cols or []) + [ts_col]
-    df = df.sort_values(sort_cols).reset_index(drop=True)
+    df = df.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
 
     return df
+    
+def _is_lexsorted(df: pd.DataFrame, ts_col: str, by_cols: list[str] | None = None) -> bool:
+    cols = (by_cols or []) + [ts_col]
+    if not cols:
+        return True
+    try:
+        idx = pd.MultiIndex.from_frame(df[cols])
+        return idx.is_monotonic_increasing
+    except Exception:
+        return False
 
 
 def _assert_sorted(df: pd.DataFrame, ts_col: str, by_cols: list[str] | None = None, label: str = "") -> None:
@@ -267,6 +291,36 @@ def join_static_with_rt_time_based(sched_df: pd.DataFrame, rt_df: pd.DataFrame, 
     _assert_sorted(schedA, "Scheduled_Arrival", by_cols, label="schedA")
     _assert_sorted(rtD, "RT_Departure", by_cols, label="rtD")
     _assert_sorted(schedD, "Scheduled_Departure", by_cols, label="schedD")
+
+    # HARD guards to fail with a clear message BEFORE merge_asof
+    if not _is_lexsorted(rtA, "RT_Arrival", by_cols):
+        # optional: dump first few offending rows for debugging
+        print("[guard] rtA not lexsorted by", by_cols + ["RT_Arrival"])
+        print(rtA[by_cols + ["RT_Arrival"]].head(15))
+        raise ValueError("rtA left keys must be lexsorted by by_cols then RT_Arrival")
+
+    if not _is_lexsorted(schedA, "Scheduled_Arrival", by_cols):
+        print("[guard] schedA not lexsorted by", by_cols + ["Scheduled_Arrival"])
+        print(schedA[by_cols + ["Scheduled_Arrival"]].head(15))
+        raise ValueError("schedA right keys must be lexsorted by by_cols then Scheduled_Arrival")
+
+    if not _is_lexsorted(rtD, "RT_Departure", by_cols):
+        print("[guard] rtD not lexsorted by", by_cols + ["RT_Departure"])
+        print(rtD[by_cols + ["RT_Departure"]].head(15))
+        raise ValueError("rtD left keys must be lexsorted by by_cols then RT_Departure")
+
+    if not _is_lexsorted(schedD, "Scheduled_Departure", by_cols):
+        print("[guard] schedD not lexsorted by", by_cols + ["Scheduled_Departure"])
+        print(schedD[by_cols + ["Scheduled_Departure"]].head(15))
+        raise ValueError("schedD right keys must be lexsorted by by_cols then Scheduled_Departure")
+
+    # EXTRA: make sure the time dtypes match left/right (tz-aware UTC on both sides)
+    if (rtA["RT_Arrival"].dtype != schedA["Scheduled_Arrival"].dtype) and (not rtA.empty and not schedA.empty):
+        raise TypeError(f"dtype mismatch on arrival keys: {rtA['RT_Arrival'].dtype} vs {schedA['Scheduled_Arrival'].dtype}")
+
+    if (rtD["RT_Departure"].dtype != schedD["Scheduled_Departure"].dtype) and (not rtD.empty and not schedD.empty):
+        raise TypeError(f"dtype mismatch on departure keys: {rtD['RT_Departure'].dtype} vs {schedD['Scheduled_Departure'].dtype}")
+
 
     # merge_asof for arrivals and departures (left = RT)
     if rtA.empty or schedA.empty:
