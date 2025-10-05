@@ -15,7 +15,7 @@ on:
       source_workflow_filename:
         description: "Your main pipeline workflow filename in .github/workflows/"
         required: true
-        default: "mta.yml"
+        default: "mta.yml"   # <-- set to pipeline.yml when you run it if that's your file name
         type: string
       transfer_window_min:
         description: "Transfer window minutes"
@@ -31,12 +31,14 @@ on:
 jobs:
   backfill:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     permissions:
       contents: read
       actions: read
     env:
       # make the secret available as an env var for if: guards
       RCLONE_CONF_B64: ${{ secrets.RCLONE_CONF_B64 }}
+
     steps:
       - uses: actions/checkout@v4
 
@@ -98,12 +100,32 @@ jobs:
               unzip -o "artifact_${RID}_${AID}.zip" -d "data/realtime/${DATE}/"
             done
           done
+          echo "Merged files in data/realtime/${DATE}:"
           ls -lh "data/realtime/${DATE}" || true
 
       - name: Fail if no CSVs recovered
         run: |
           DATE="${{ steps.vars.outputs.DATE }}"
           ls "data/realtime/${DATE}"/*.csv 1>/dev/null 2>&1 || { echo "No CSVs found"; exit 1; }
+
+      # --------- NEW: cache & prime static GTFS so we don't refetch every run ----------
+      - name: Cache GTFS static
+        uses: actions/cache@v4
+        with:
+          path: gtfs_static
+          key: gtfs-static-v1
+          restore-keys: |
+            gtfs-static-
+
+      - name: Prime static GTFS if missing
+        run: |
+          if ls gtfs_static/subway_all_*.zip 1>/dev/null 2>&1; then
+            echo "Static GTFS already present. Skipping refresh."
+          else
+            echo "No static GTFS found. Refreshing…"
+            python pollers/mta_static_refresh.py
+          fi
+      # ---------------------------------------------------------------------------------
 
       - name: Run build_master once on the merged folder
         env:
