@@ -243,6 +243,83 @@ def _assert_sorted(df: pd.DataFrame, ts_col: str, by_cols: list[str] | None = No
         if not df[ts_col].is_monotonic_increasing:
             raise ValueError(f"[asof-guard] {label}: {ts_col} not globally sorted.")
 
+def _group_keys_intersection(left: pd.DataFrame, right: pd.DataFrame, by_cols: list[str]) -> pd.DataFrame:
+    """
+    Return a DataFrame of unique key tuples that exist in BOTH left and right.
+    """
+    if not by_cols:
+        return pd.DataFrame({"_dummy": [1]})
+    lkeys = left[by_cols].drop_duplicates()
+    rkeys = right[by_cols].drop_duplicates()
+    both = lkeys.merge(rkeys, on=by_cols, how="inner")
+    return both
+
+
+def _groupwise_asof(
+    left: pd.DataFrame,
+    right: pd.DataFrame,
+    left_on: str,
+    right_on: str,
+    by_cols: list[str],
+    tolerance: pd.Timedelta,
+    direction: str = "nearest",
+    allow_exact_matches: bool = True,
+) -> pd.DataFrame:
+    """
+    Perform pd.merge_asof per (by_cols) group, then concat.
+    This avoids pandas' global 'keys must be sorted' error because each mini-merge
+    is trivially sorted on its own subset.
+    """
+    # Early outs
+    if left.empty or right.empty:
+        return pd.DataFrame()
+
+    # Filter to key tuples that appear on BOTH sides
+    keys = _group_keys_intersection(left, right, by_cols)
+
+    out = []
+    # No grouping case: do a single group merge
+    if not by_cols:
+        l = left.sort_values([left_on], kind="mergesort").reset_index(drop=True)
+        r = right.sort_values([right_on], kind="mergesort").reset_index(drop=True)
+        merged = pd.merge_asof(
+            l, r,
+            left_on=left_on, right_on=right_on,
+            direction=direction, tolerance=tolerance,
+            allow_exact_matches=allow_exact_matches
+        )
+        return merged
+
+    # Grouped case
+    # Iterate only over keys present in both
+    for _, keyrow in keys.iterrows():
+        # Build mask per column (fast & explicit)
+        lmask = pd.Series(True, index=left.index)
+        rmask = pd.Series(True, index=right.index)
+        for c in by_cols:
+            val = keyrow[c]
+            lmask &= (left[c] == val)
+            rmask &= (right[c] == val)
+
+        lg = left.loc[lmask]
+        rg = right.loc[rmask]
+        if lg.empty or rg.empty:
+            continue
+
+        lg = lg.sort_values([left_on], kind="mergesort").reset_index(drop=True)
+        rg = rg.sort_values([right_on], kind="mergesort").reset_index(drop=True)
+
+        merged = pd.merge_asof(
+            lg, rg,
+            left_on=left_on, right_on=right_on,
+            direction=direction, tolerance=tolerance,
+            allow_exact_matches=allow_exact_matches
+        )
+        out.append(merged)
+
+    if not out:
+        return pd.DataFrame(columns=list(set(left.columns) | set(right.columns)))
+    return pd.concat(out, ignore_index=True)
 
 # -------------------- TIME-BASED MATCH --------------------
 def join_static_with_rt_time_based(sched_df: pd.DataFrame, rt_df: pd.DataFrame, tolerance_min: int = 30) -> pd.DataFrame:
@@ -279,6 +356,8 @@ def join_static_with_rt_time_based(sched_df: pd.DataFrame, rt_df: pd.DataFrame, 
     # Choose grouping keys that exist on both sides (stable & specific first)
     candidate_by = ["stop_id_norm", "route_id"]
     by_cols = [c for c in candidate_by if c in sched_df.columns and c in rt_df.columns]
+
+    print(f"[join] by_cols={by_cols}  rtA={len(rtA)}  schedA={len(schedA)}  rtD={len(rtD)}  schedD={len(schedD)}")
 
     # Prepare both sides (casts, drops, sorts)
     rtA = _prep_for_asof(rtA, "RT_Arrival", by_cols)
@@ -322,25 +401,33 @@ def join_static_with_rt_time_based(sched_df: pd.DataFrame, rt_df: pd.DataFrame, 
         raise TypeError(f"dtype mismatch on departure keys: {rtD['RT_Departure'].dtype} vs {schedD['Scheduled_Departure'].dtype}")
 
 
-    # merge_asof for arrivals and departures (left = RT)
+    # Groupwise asof merges (left = RT)
     if rtA.empty or schedA.empty:
         a = pd.DataFrame()
     else:
-        a = pd.merge_asof(
-            rtA, schedA,
-            left_on="RT_Arrival", right_on="Scheduled_Arrival",
-            by=by_cols if by_cols else None,
-            direction="nearest", tolerance=tol, allow_exact_matches=True
+        a = _groupwise_asof(
+            left=rtA,
+            right=schedA,
+            left_on="RT_Arrival",
+            right_on="Scheduled_Arrival",
+            by_cols=by_cols or [],
+            tolerance=tol,
+            direction="nearest",
+            allow_exact_matches=True,
         )
 
     if rtD.empty or schedD.empty:
         d = pd.DataFrame()
     else:
-        d = pd.merge_asof(
-            rtD, schedD,
-            left_on="RT_Departure", right_on="Scheduled_Departure",
-            by=by_cols if by_cols else None,
-            direction="nearest", tolerance=tol, allow_exact_matches=True
+        d = _groupwise_asof(
+            left=rtD,
+            right=schedD,
+            left_on="RT_Departure",
+            right_on="Scheduled_Departure",
+            by_cols=by_cols or [],
+            tolerance=tol,
+            direction="nearest",
+            allow_exact_matches=True,
         )
 
     # If both were empty, return a coherent empty schema
