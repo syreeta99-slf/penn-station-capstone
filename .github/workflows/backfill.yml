@@ -1,0 +1,142 @@
+name: Backfill event-level dataset for a past date
+
+on:
+  workflow_dispatch:
+    inputs:
+      backfill_date:
+        description: "Service date (YYYY-MM-DD)"
+        required: true
+        type: string
+      artifact_name:
+        description: "Name of the realtime CSVs artifact from your main workflow"
+        required: true
+        default: "subway_realtime_csvs"
+        type: string
+      source_workflow_filename:
+        description: "Your main pipeline workflow filename in .github/workflows/"
+        required: true
+        default: "mta.yml"
+        type: string
+      transfer_window_min:
+        description: "Transfer window minutes"
+        required: true
+        default: "20"
+        type: string
+      missed_threshold_min:
+        description: "Missed threshold minutes"
+        required: true
+        default: "2"
+        type: string
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Install gh/jq/unzip
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq unzip
+          echo "${{ github.token }}" | gh auth login --with-token
+
+      - name: Resolve inputs
+        id: vars
+        run: |
+          echo "DATE=${{ inputs.backfill_date }}" >> $GITHUB_OUTPUT
+          echo "ART=${{ inputs.artifact_name }}" >> $GITHUB_OUTPUT
+          echo "WF_FILE=${{ inputs.source_workflow_filename }}" >> $GITHUB_OUTPUT
+          echo "START=${{ inputs.backfill_date }}T00:00:00Z" >> $GITHUB_OUTPUT
+          echo "END=${{ inputs.backfill_date }}T23:59:59Z" >> $GITHUB_OUTPUT
+
+      - name: Find workflow id
+        id: wf
+        run: |
+          WF_FILE="${{ steps.vars.outputs.WF_FILE }}"
+          WF_ID=$(gh api /repos/${{ github.repository }}/actions/workflows \
+            --jq ".workflows[] | select(.path | endswith(\"/${WF_FILE}\")) | .id")
+          if [ -z "$WF_ID" ]; then
+            echo "Could not find workflow $WF_FILE"; exit 1; fi
+          echo "WF_ID=$WF_ID" >> $GITHUB_OUTPUT
+
+      - name: List runs on that date
+        id: runs
+        run: |
+          WF_ID="${{ steps.wf.outputs.WF_ID }}"
+          gh api "/repos/${{ github.repository }}/actions/workflows/${WF_ID}/runs?per_page=200" \
+            --jq ".workflow_runs[] | {id, created_at}" > runs.json
+          jq --arg start "${{ steps.vars.outputs.START }}" --arg end "${{ steps.vars.outputs.END }}" \
+             'select(.created_at >= $start and .created_at <= $end)' runs.json > runs_filtered.json
+          jq -s '[.[] | .id]' runs_filtered.json > run_ids.json
+          COUNT=$(jq length run_ids.json)
+          echo "COUNT=$COUNT" >> $GITHUB_OUTPUT
+          echo "Found $COUNT runs"
+
+      - name: Download & merge realtime artifacts
+        if: steps.runs.outputs.COUNT != '0'
+        run: |
+          DATE="${{ steps.vars.outputs.DATE }}"
+          ART="${{ steps.vars.outputs.ART }}"
+          mkdir -p "data/realtime/${DATE}"
+          for RID in $(jq -r '.[]' run_ids.json); do
+            gh api "/repos/${{ github.repository }}/actions/runs/${RID}/artifacts" > "artifacts_${RID}.json"
+            for AID in $(jq -r --arg n "$ART" '.artifacts[] | select(.name==$n) | .id' "artifacts_${RID}.json"); do
+              gh api "/repos/${{ github.repository }}/actions/artifacts/${AID}/zip" > "artifact_${RID}_${AID}.zip"
+              unzip -o "artifact_${RID}_${AID}.zip" -d "data/realtime/${DATE}/"
+            done
+          done
+          ls -lh "data/realtime/${DATE}" || true
+
+      - name: Fail if no CSVs recovered
+        run: |
+          DATE="${{ steps.vars.outputs.DATE }}"
+          ls "data/realtime/${DATE}"/*.csv 1>/dev/null 2>&1 || { echo "No CSVs found"; exit 1; }
+
+      - name: Run build_master once on the merged folder
+        env:
+          RT_DIR: data/realtime/${{ steps.vars.outputs.DATE }}
+          RT_MAX_FILES: "999999"
+          SERVICE_DATE: ${{ steps.vars.outputs.DATE }}
+          TRANSFER_WINDOW_MIN: ${{ inputs.transfer_window_min }}
+          MISSED_THRESHOLD_MIN: ${{ inputs.missed_threshold_min }}
+        run: python pollers/build_master.py
+
+      - name: Upload curated partition as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: curated_backfill_${{ steps.vars.outputs.DATE }}
+          path: |
+            data/curated/master_interface_dataset.csv
+            data/curated/master_interface_dataset.parquet
+            data/curated/master_interface_agg.csv
+            data/curated/master_interface_agg.parquet
+            data/curated/master_interface_dataset_summary.json
+            data/curated/service_date=${{ steps.vars.outputs.DATE }}/**
+          retention-days: 30
+
+      # Optional: push to Google Drive to keep history
+      - name: Install rclone
+        run: curl -fsSL https://rclone.org/install.sh | sudo bash
+
+      - name: Write rclone.conf
+        if: ${{ secrets.RCLONE_CONF_B64 != '' }}
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "${{ secrets.RCLONE_CONF_B64 }}" | base64 -d > ~/.config/rclone/rclone.conf
+          chmod 600 ~/.config/rclone/rclone.conf
+
+      - name: Sync curated to Drive (optional)
+        if: ${{ secrets.RCLONE_CONF_B64 != '' }}
+        run: |
+          rclone copy data/curated googledrive:penn-station/curated \
+            --create-empty-src-dirs --checksum --transfers=4 --checkers=8
