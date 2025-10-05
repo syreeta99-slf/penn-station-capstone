@@ -50,7 +50,7 @@ jobs:
         run: |
           trap 'echo "[signal] SIGTERM during realtime poller"; exit 143' SIGTERM
           # Adjust to your entrypoint as needed:
-          python pollers/subway_realtime.py
+          python pollers/mta_subway_realtime.py
 
       # ---- Per-run RT artifact (used by backfill fallback) ----
       - name: Upload per-run realtime artifact
