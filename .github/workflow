@@ -37,20 +37,29 @@ jobs:
           restore-keys: |
             njt-token-
 
-      # If cache missed, fetch exactly one token for the day and save it
-      - name: Warm token if missing
+      # If cache missed, try to warm exactly one token for the day.
+      # IMPORTANT: Do not fail the job if issuance hits the daily limit.
+      - name: Warm token if missing (non-fatal on daily limit)
         if: steps.token_cache.outputs.cache-hit != 'true'
         env:
           NJT_ENV: "prod"
           NJT_USERNAME: ${{ secrets.NJT_USERNAME }}
           NJT_PASSWORD: ${{ secrets.NJT_PASSWORD }}
           PYTHONUNBUFFERED: "1"
+        shell: bash
         run: |
           mkdir -p ~/.njt
-          python pollers/njt_realtime_rail.py --warm-token
-          test -s ~/.njt/token.json || { echo "Token warm failed"; exit 1; }
+          # Run warm; if it fails (e.g., daily limit), don't fail the workflow
+          python pollers/njt_realtime_rail.py --warm-token || echo "Warm token failed (likely daily limit); continuing."
+          # If token is present, great. If not, log it and continue.
+          if [ -s ~/.njt/token.json ]; then
+            echo "Token present in cache."
+          else
+            echo "No token available this UTC day (daily limit). Poller will skip work gracefully."
+          fi
 
       # Normal poll (script will reuse cached token and only refresh once on 401)
+      # Guarded so daily-limit/401/network blips don't fail the workflow.
       - name: Run NJT Rail poller
         env:
           NJT_ENV: "prod"                      # use "test" while iterating
@@ -60,9 +69,10 @@ jobs:
           NJT_INCLUDE_VP: "1"
           TZ: "UTC"
           PYTHONUNBUFFERED: "1"
+        shell: bash
         run: |
           mkdir -p ~/.njt
-          python pollers/njt_realtime_rail.py
+          python pollers/njt_realtime_rail.py || echo "NJT daily limit or transient error; not failing workflow"
 
       - name: Upload realtime CSVs (artifact)
         uses: actions/upload-artifact@v4
