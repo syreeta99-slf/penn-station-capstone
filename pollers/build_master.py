@@ -373,15 +373,19 @@ def join_static_with_rt_time_based(sched_df: pd.DataFrame, rt_df: pd.DataFrame, 
         ])
 
     # ----------------- Combine arrivals & departures -----------------
-    # Prefer by_cols for merge keys
-    merge_keys = [k for k in (by_cols or []) if (k in a.columns) and (k in d.columns)]
-    if not merge_keys:
-        # unlikely with the slim setup; keep a safe fallback
-        if not a.empty: a = a.copy(); a["_const"] = 1
-        if not d.empty: d = d.copy(); d["_const"] = 1
-        merge_keys = ["_const"]
+    # Prefer trip_id for a 1:1-ish pair; else use a 1-minute time bucket to avoid cartesian blow-ups
+    a = a.copy(); d = d.copy()
+    if "trip_id_arr" in a.columns and "trip_id_dep" in d.columns:
+        a["trip_id"] = a["trip_id_arr"]
+        d["trip_id"] = d["trip_id_dep"]
+        merge_keys = [*(by_cols or []), "trip_id"]
+    else:
+        a["rt_min_bucket"] = pd.to_datetime(a["RT_Arrival"], utc=True, errors="coerce").dt.floor("min")
+        d["rt_min_bucket"] = pd.to_datetime(d["RT_Departure"], utc=True, errors="coerce").dt.floor("min")
+        merge_keys = [*(by_cols or []), "rt_min_bucket"]
 
     print(f"[combine] merge_keys={merge_keys}  a_cols={list(a.columns)[:8]}...  d_cols={list(d.columns)[:8]}...")
+
     out = pd.merge(a, d, on=merge_keys, how="outer", suffixes=("_arr","_dep"), copy=False)
 
     # Ensure arrival/departure timestamp columns exist
