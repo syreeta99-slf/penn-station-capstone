@@ -1,0 +1,45 @@
+name: NJT static (weekly)
+
+on:
+  schedule:
+    # Weekly Sunday 03:30 UTC (adjust if you like)
+    - cron: "30 3 * * 0"
+  workflow_dispatch: {}
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install requests
+
+      # Optional: cache folder so multiple runs don't redownload
+      - name: Cache gtfs_static_njt
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: gtfs_static_njt
+          key: gtfs-static-njt
+
+      - name: Download NJT GTFS static
+        env:
+          NJT_GTFS_STATIC_URL: ${{ vars.NJT_GTFS_STATIC_URL }}
+        run: |
+          python pollers/njt_static_refresh.py
+          ls -lh gtfs_static_njt
+
+      - name: Upload static as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: njt_static_gtfs
+          path: gtfs_static_njt/*.zip
+          retention-days: 14
