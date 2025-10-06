@@ -1,0 +1,41 @@
+name: NJT Rail GTFS-RT poller
+
+on:
+  schedule:
+    # every 2 minutes (tune to your needs & quotas)
+    - cron: "*/2 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Run NJT Rail poller
+        env:
+          NJT_ENV: "prod"            # or "test" while you iterate
+          NJT_USERNAME: ${{ secrets.NJT_USERNAME }}
+          NJT_PASSWORD: ${{ secrets.NJT_PASSWORD }}
+          NJT_OUT_DIR: data/realtime_njt
+          NJT_INCLUDE_VP: "1"
+          TZ: "UTC"
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python pollers/njt_realtime_rail.py
+
+      - name: Upload realtime CSVs (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: njt_realtime_${{ github.run_id }}
+          path: data/realtime_njt/*.csv
+          retention-days: 7
