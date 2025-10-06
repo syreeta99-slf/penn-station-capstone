@@ -9,6 +9,30 @@ on:
     - cron: "0 12-23 * * 6,0"     # Weekend hourly (08:00–19:00 ET)
     - cron: "0 0-2 * * 0,1"       # Weekend late (20:00–22:59 ET)
   workflow_dispatch:
+     inputs:
+      missed_threshold_min:
+        description: "Minutes needed to make a transfer (missed if gap < this)"
+        required: false
+        type: choice
+        default: "2"
+        options: ["1","2","3","5"]
+      transfer_window_min:
+        description: "Max window to consider a transfer (minutes)"
+        required: false
+        type: choice
+        default: "20"
+        options: ["10","15","20","25","30"]
+      rt_max_files:
+        description: "How many most-recent RT CSVs to consider"
+        required: false
+        default: "120"
+        type: choice
+        options: ["60","90","120","180","240"]
+      service_date:
+        description: "Override service date (YYYY-MM-DD); leave blank to infer"
+        required: false
+        default: ""
+        type: string
 
 concurrency:
   group: pipeline-${{ github.ref }}
@@ -78,18 +102,18 @@ jobs:
       - name: Build master & append
         env:
           PYTHONUNBUFFERED: "1"
-          APPEND_TO_MASTER: "1"   # <- ensures rolling append in build_master.py
-          ALLOW_STATIC_REFRESH: "0"  # static is cached above; keep refresh out of this run
+          APPEND_TO_MASTER: "1"
+          ALLOW_STATIC_REFRESH: "0"
           RT_DIR: data/realtime
-          RT_MAX_FILES: "120"     # consider only most-recent files (tune as you like)
-          # Optional knobs:
-          # TRANSFER_WINDOW_MIN: "20"
-          # MISSED_THRESHOLD_MIN: "2"
+          RT_MAX_FILES: ${{ inputs.rt_max_files || '120' }}
+          TRANSFER_WINDOW_MIN: ${{ inputs.transfer_window_min || '20' }}
+          MISSED_THRESHOLD_MIN: ${{ inputs.missed_threshold_min || '2' }}
+          SERVICE_DATE: ${{ inputs.service_date || '' }}
         run: |
           echo "[t0] starting build_master"
           python pollers/build_master.py
           echo "[t1] build_master finished"
-
+          
       # ---- Upload curated outputs (what you analyze / sync to Drive)
       - name: Upload curated outputs
         uses: actions/upload-artifact@v4
