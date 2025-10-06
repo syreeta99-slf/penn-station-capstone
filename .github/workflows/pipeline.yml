@@ -1,15 +1,14 @@
-name: MTA Subway – Scheduled Build
+name: MTA Subway – Rolling Master to Google Drive
 
 on:
   schedule:
-    # UTC schedule; these cover common NYC windows (adjust as you like)
-    - cron: "*/10 10-15 * * 1-5"  # Weekday AM coverage (06:00–11:59 ET)
-    - cron: "*/10 20-23 * * 1-5"  # Weekday PM coverage (16:00–19:59 ET)
-    - cron: "*/10 0-1 * * 1-5"    # Weekday evening (20:00–21:59 ET)
-    - cron: "0 12-23 * * 6,0"     # Weekend hourly (08:00–19:00 ET)
-    - cron: "0 0-2 * * 0,1"       # Weekend late (20:00–22:59 ET)
+    - cron: "*/10 10-15 * * 1-5"
+    - cron: "*/10 20-23 * * 1-5"
+    - cron: "*/10 0-1 * * 1-5"
+    - cron: "0 12-23 * * 6,0"
+    - cron: "0 0-2 * * 0,1"
   workflow_dispatch:
-     inputs:
+    inputs:
       missed_threshold_min:
         description: "Minutes needed to make a transfer (missed if gap < this)"
         required: false
@@ -46,6 +45,11 @@ jobs:
       contents: read
       actions: read
 
+    env:
+      # Your exact rclone remote name and Drive folder (quotes allow spaces)
+      GDRIVE_REMOTE_NAME: "googledrive"
+      GDRIVE_DIR: "penn-station/curated"
+
     steps:
       - uses: actions/checkout@v4
 
@@ -58,20 +62,41 @@ jobs:
 
       - name: Sanity check repo layout
         run: |
-          echo "[repo] top-level:"
-          ls -lh
-          echo "[pollers/] contents:"
-          ls -lh pollers || true
+          echo "[repo] top-level:"; ls -lh
           test -f pollers/mta_realtime_subway.py || { echo "::error::pollers/mta_realtime_subway.py missing"; exit 1; }
           test -f pollers/build_master.py        || { echo "::error::pollers/build_master.py missing"; exit 1; }
 
-      # ---- Poll realtime (writes data/realtime/subway_rt_YYYYmmdd_HHMMSS.csv)
+      # ===== rclone install & configure =====
+      - name: Install rclone
+        run: |
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          rclone version
+
+      - name: Write rclone.conf from Base64 secret
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "${{ secrets.RCLONE_CONF_B64 }}" | base64 -d > ~/.config/rclone/rclone.conf
+          chmod 600 ~/.config/rclone/rclone.conf
+          rclone listremotes
+          rclone about "${{ env.GDRIVE_REMOTE_NAME }}:" || (echo "Drive remote not reachable"; exit 1)
+
+      # ===== PRE-SYNC: pull current master from Drive so we can append =====
+      - name: Pull prior master from Drive
+        run: |
+          mkdir -p data/curated
+          rclone lsd "${{ env.GDRIVE_REMOTE_NAME }}:${{ env.GDRIVE_DIR }}" || true
+          rclone copy "${{ env.GDRIVE_REMOTE_NAME }}:${{ env.GDRIVE_DIR }}" data/curated \
+            --include "master_interface_dataset.csv" \
+            --include "master_interface_dataset.parquet" \
+            --max-depth 1 --ignore-existing || true
+          ls -lh data/curated || true
+
+      # ===== Poll realtime =====
       - name: Run realtime poller
         env:
           MTA_API_KEY: ${{ secrets.MTA_API_KEY }}
         run: python pollers/mta_realtime_subway.py
 
-      # Keep a short-lived artifact of the raw CSVs for backfill/debug
       - name: Upload realtime CSVs (artifact)
         uses: actions/upload-artifact@v4
         with:
@@ -79,7 +104,7 @@ jobs:
           path: data/realtime/*.csv
           retention-days: 3
 
-      # ---- Cache GTFS static so build_master won’t refetch every time
+      # ===== Ensure static GTFS present =====
       - name: Cache GTFS static
         id: gtfs_cache
         uses: actions/cache@v4
@@ -98,11 +123,11 @@ jobs:
             python pollers/mta_static_refresh.py
           fi
 
-      # ---- Build & append to rolling master
+      # ===== Build & APPEND to rolling master =====
       - name: Build master & append
         env:
           PYTHONUNBUFFERED: "1"
-          APPEND_TO_MASTER: "1"
+          APPEND_TO_MASTER: "1"       # << always append moving forward
           ALLOW_STATIC_REFRESH: "0"
           RT_DIR: data/realtime
           RT_MAX_FILES: ${{ inputs.rt_max_files || '120' }}
@@ -113,29 +138,23 @@ jobs:
           echo "[t0] starting build_master"
           python pollers/build_master.py
           echo "[t1] build_master finished"
-          
-      # ---- Upload curated outputs (what you analyze / sync to Drive)
-      - name: Upload curated outputs
+
+      - name: Upload curated outputs (artifact)
         uses: actions/upload-artifact@v4
         with:
           name: curated_outputs
           path: |
             data/curated/master_interface_dataset.csv
             data/curated/master_interface_dataset.parquet
-            data/curated/master_interface_agg.csv
-            data/curated/master_interface_agg.parquet
-            data/curated/master_interface_dataset_summary.json
           retention-days: 7
 
-      # If you sync to Google Drive in this pipeline, keep your existing rclone step here.
-      # Example (uncomment & set your remote + path):
-      # - name: Sync curated to Google Drive
-      #   if: ${{ secrets.RCLONE_CONF_B64 != '' }}
-      #   env:
-      #     RCLONE_CONF_B64: ${{ secrets.RCLONE_CONF_B64 }}
-      #   run: |
-      #     mkdir -p ~/.config/rclone
-      #     echo "$RCLONE_CONF_B64" | base64 -d > ~/.config/rclone/rclone.conf
-      #     chmod 600 ~/.config/rclone/rclone.conf
-      #     rclone copy data/curated googledrive:penn-station/curated \
-      #       --create-empty-src-dirs --checksum --transfers=4 --checkers=8
+      # ===== POST-SYNC: push updated master back to Drive =====
+      - name: Push updated master to Drive
+        run: |
+          rclone copy data/curated "${{ env.GDRIVE_REMOTE_NAME }}:${{ env.GDRIVE_DIR }}" \
+            --include "master_interface_dataset.csv" \
+            --include "master_interface_dataset.parquet" \
+            --create-empty-src-dirs \
+            --transfers 4 --checkers 8 \
+            --drive-chunk-size 64M \
+            --update --progress
