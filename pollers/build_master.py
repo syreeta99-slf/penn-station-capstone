@@ -71,6 +71,16 @@ def parse_gtfs_time_to_dt(hms: str, service_date: str) -> pd.Timestamp:
     return base + pd.Timedelta(days=extra_days, hours=h, minutes=m, seconds=s)
 
 # --------------------- INPUT HELPERS -----------------------
+def _uniq_cols(base: list[str], extras: list[str]) -> list[str]:
+    """Append extras to base, skipping duplicates while preserving order."""
+    seen = set(base)
+    out = list(base)
+    for c in extras:
+        if c not in seen:
+            out.append(c)
+            seen.add(c)
+    return out
+
 def latest_static_zip() -> Path:
     zips = sorted(STATIC_DIR.glob("subway_all_*.zip")) or sorted(STATIC_DIR.glob("subway_all*.zip"))
     if not zips and ALLOW_STATIC_REFRESH == "1":
@@ -294,10 +304,15 @@ def join_static_with_rt_time_based(sched_df: pd.DataFrame, rt_df: pd.DataFrame, 
     by_cols = [c for c in candidate_by if c in sched_df.columns and c in rt_df.columns]
 
     # Build slim FULL views that include by_cols; DO NOT rename by_cols
-    rtA_full    = rt_df[by_cols + ["trip_id","stop_id","stop_id_norm","route_id","rt_arrival_utc"]].rename(columns={"rt_arrival_utc":"RT_Arrival"})
-    rtD_full    = rt_df[by_cols + ["trip_id","stop_id","stop_id_norm","route_id","rt_departure_utc"]].rename(columns={"rt_departure_utc":"RT_Departure"})
-    schedA_full = sched_df[by_cols + ["Scheduled_Arrival"]]
-    schedD_full = sched_df[by_cols + ["Scheduled_Departure"]]
+    rtA_cols    = _uniq_cols(by_cols, ["trip_id","stop_id","stop_id_norm","route_id","rt_arrival_utc"])
+    rtD_cols    = _uniq_cols(by_cols, ["trip_id","stop_id","stop_id_norm","route_id","rt_departure_utc"])
+    schedA_cols = _uniq_cols(by_cols, ["Scheduled_Arrival"])
+    schedD_cols = _uniq_cols(by_cols, ["Scheduled_Departure"])
+
+    rtA_full    = rt_df[rtA_cols].rename(columns={"rt_arrival_utc":"RT_Arrival"})
+    rtD_full    = rt_df[rtD_cols].rename(columns={"rt_departure_utc":"RT_Departure"})
+    schedA_full = sched_df[schedA_cols]
+    schedD_full = sched_df[schedD_cols]
 
     # Prep (casts, drops, stable sort)
     rtA    = _prep_for_asof(rtA_full,    "RT_Arrival",          by_cols)
@@ -305,24 +320,32 @@ def join_static_with_rt_time_based(sched_df: pd.DataFrame, rt_df: pd.DataFrame, 
     schedA = _prep_for_asof(schedA_full, "Scheduled_Arrival",   by_cols)
     schedD = _prep_for_asof(schedD_full, "Scheduled_Departure", by_cols)
 
-    # Final slim views for groupwise asof (preserve by_cols; only rename non-by IDs)
-    leftA  = rtA[by_cols + ["RT_Arrival","trip_id","stop_id"]].rename(
-        columns={"trip_id":"trip_id_arr","stop_id":"stop_id_arr"}
-    )
-    rightA = schedA[by_cols + ["Scheduled_Arrival"]]
+    # ---- Final slim views for groupwise asof (preserve by_cols; only rename non-by IDs) ----
+    leftA  = rtA[_uniq_cols(by_cols, ["RT_Arrival","trip_id","stop_id"])] \
+            .rename(columns={"trip_id":"trip_id_arr","stop_id":"stop_id_arr"})
+    rightA = schedA[_uniq_cols(by_cols, ["Scheduled_Arrival"])]
 
-    leftD  = rtD[by_cols + ["RT_Departure","trip_id","stop_id"]].rename(
-        columns={"trip_id":"trip_id_dep","stop_id":"stop_id_dep"}
-    )
-    rightD = schedD[by_cols + ["Scheduled_Departure"]]
+    leftD  = rtD[_uniq_cols(by_cols, ["RT_Departure","trip_id","stop_id"])] \
+            .rename(columns={"trip_id":"trip_id_dep","stop_id":"stop_id_dep"})
+    rightD = schedD[_uniq_cols(by_cols, ["Scheduled_Departure"])]
 
-    # Quick sanity: by_cols must be on all sides
+    # (Optional safety asserts — helpful in CI logs)
+    assert leftA.columns.is_unique and rightA.columns.is_unique and leftD.columns.is_unique and rightD.columns.is_unique, \
+        "[join] got duplicate column labels after slimming; check by_cols/rename logic"
+
+    # Quick sanity: by_cols must be on all sides and columns must be unique
     for side_name, frame in [("leftA", leftA), ("rightA", rightA), ("leftD", leftD), ("rightD", rightD)]:
-        missing = [c for c in by_cols if c not in frame.columns]
-        if missing:
-            raise KeyError(f"[join] {side_name} missing by_cols {missing}; has {list(frame.columns)}")
+        # 1) columns unique
+        if not frame.columns.is_unique:
+        dupes = frame.columns[frame.columns.duplicated()].tolist()
+        raise ValueError(f"[join] {side_name} has duplicate columns: {dupes}. cols={list(frame.columns)}")
+    # 2) by_cols present
+    missing = [c for c in by_cols if c not in frame.columns]
+    if missing:
+        raise KeyError(f"[join] {side_name} missing by_cols {missing}; has {list(frame.columns)}")
 
     print(f"[join] by_cols={by_cols}  rtA={len(rtA)}  schedA={len(schedA)}  rtD={len(rtD)}  schedD={len(schedD)}")
+
 
     # Groupwise asof (left=RT, right=Schedule)
     a = _groupwise_asof(
