@@ -2,8 +2,8 @@ name: NJT Rail GTFS-RT poller
 
 on:
   schedule:
-    # every 2 minutes (tune to your needs & quotas)
-    - cron: "*/2 * * * *"
+    # poll every 5 minutes (safer for logs/quotas)
+    - cron: "*/5 * * * *"
   workflow_dispatch: {}
 
 jobs:
@@ -11,6 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+
     steps:
       - uses: actions/checkout@v4
 
@@ -21,20 +22,38 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
-      # --- Cache token file daily ---
-      - name: Cache NJT token
+      # Use a stable date key so all runs TODAY share the same cached token
+      - name: Compute date key (UTC)
+        id: date
+        run: echo "today=$(date -u +%F)" >> $GITHUB_OUTPUT
+
+      # Cache ~/.njt/token.json for the whole UTC day
+      - name: Cache NJT token (per day)
         id: token_cache
         uses: actions/cache@v4
         with:
           path: ~/.njt/token.json
-          key: njt-token-${{ github.run_id }}-${{ github.run_attempt }}
+          key: njt-token-${{ steps.date.outputs.today }}
           restore-keys: |
             njt-token-
 
-      # --- Run NJT Rail poller with cached token ---
+      # If cache missed, fetch exactly one token for the day and save it
+      - name: Warm token if missing
+        if: steps.token_cache.outputs.cache-hit != 'true'
+        env:
+          NJT_ENV: "prod"
+          NJT_USERNAME: ${{ secrets.NJT_USERNAME }}
+          NJT_PASSWORD: ${{ secrets.NJT_PASSWORD }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          mkdir -p ~/.njt
+          python pollers/njt_realtime_rail.py --warm-token
+          test -s ~/.njt/token.json || { echo "Token warm failed"; exit 1; }
+
+      # Normal poll (script will reuse cached token and only refresh once on 401)
       - name: Run NJT Rail poller
         env:
-          NJT_ENV: "prod"            # or "test" while you iterate
+          NJT_ENV: "prod"                      # use "test" while iterating
           NJT_USERNAME: ${{ secrets.NJT_USERNAME }}
           NJT_PASSWORD: ${{ secrets.NJT_PASSWORD }}
           NJT_OUT_DIR: data/realtime_njt
@@ -48,6 +67,6 @@ jobs:
       - name: Upload realtime CSVs (artifact)
         uses: actions/upload-artifact@v4
         with:
-          name: njt_realtime_${{ github.run_id }}
+          name: njt_realtime_${{ steps.date.outputs.today }}
           path: data/realtime_njt/*.csv
           retention-days: 7
