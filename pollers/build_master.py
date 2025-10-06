@@ -2,7 +2,7 @@
 """
 pollers/build_master.py
 
-Build the event-level Master Interface Dataset by joining:
+Builds the event-level Master Interface Dataset by joining:
 - Static GTFS (scheduled) from gtfs_static/subway_all_YYYYMMDD.zip
 - Realtime subway polls from data/realtime/subway_rt_*.csv (or RT_DIR)
 
@@ -33,8 +33,8 @@ CURATED_DIR.mkdir(parents=True, exist_ok=True)
 
 # Env knobs
 RT_DIR = Path(os.getenv("RT_DIR", str(REALTIME_DIR)))
-RT_MAX_FILES = int(os.getenv("RT_MAX_FILES", "60"))  # newest CSVs to consider
-SERVICE_DATE_OVERRIDE = os.getenv("SERVICE_DATE", "")  # YYYY-MM-DD or empty
+RT_MAX_FILES = int(os.getenv("RT_MAX_FILES", "60"))  # newest CSVs to consider (increase for backfill)
+SERVICE_DATE_OVERRIDE = os.getenv("SERVICE_DATE", "")  # YYYY-MM-DD or empty to infer
 TRANSFER_WINDOW_MIN = int(os.getenv("TRANSFER_WINDOW_MIN", "20"))
 MISSED_THRESHOLD_MIN = float(os.getenv("MISSED_THRESHOLD_MIN", "2"))
 ALLOW_STATIC_REFRESH = os.getenv("ALLOW_STATIC_REFRESH", "1")
@@ -43,13 +43,13 @@ APPEND_TO_MASTER = os.getenv("APPEND_TO_MASTER", "0") == "1"
 AM_PEAK = range(6, 10)   # 06–09 local
 PM_PEAK = range(16, 20)  # 16–19 local
 
-# Route → Node mapping (tune as needed)
+# ----------------------- ROUTE GROUPS ----------------------
+# Map route_id → coarse node for interface edges (tune as needed)
 ROUTE_GROUPS = {
     "Subway_123": set(list("123") + ["4", "5", "6", "7", "S"]),
     "Subway_ACE": set(list("ACE")),
 }
 
-# ----------------------- HELPERS ---------------------------
 def route_to_node(route_id: str) -> str:
     if pd.isna(route_id) or route_id is None:
         return "Subway_Unknown"
@@ -59,7 +59,7 @@ def route_to_node(route_id: str) -> str:
             return node
     return "Subway_Other"
 
-
+# ------------------- STATIC TIME PARSING -------------------
 def parse_gtfs_time_to_dt(hms: str, service_date: str) -> pd.Timestamp:
     """Handle 24+ hour GTFS times relative to service_date (UTC)."""
     try:
@@ -70,7 +70,7 @@ def parse_gtfs_time_to_dt(hms: str, service_date: str) -> pd.Timestamp:
     base = pd.Timestamp(service_date).tz_localize("UTC")
     return base + pd.Timedelta(days=extra_days, hours=h, minutes=m, seconds=s)
 
-
+# --------------------- INPUT HELPERS -----------------------
 def latest_static_zip() -> Path:
     zips = sorted(STATIC_DIR.glob("subway_all_*.zip")) or sorted(STATIC_DIR.glob("subway_all*.zip"))
     if not zips and ALLOW_STATIC_REFRESH == "1":
@@ -81,21 +81,12 @@ def latest_static_zip() -> Path:
         raise FileNotFoundError("No subway_all_*.zip in gtfs_static/.")
     return zips[-1]
 
-
 def read_txt_from_zip(zip_path: Path, member: str) -> pd.DataFrame:
     with zipfile.ZipFile(zip_path, "r") as zf:
         return pd.read_csv(io.BytesIO(zf.read(member)))
 
-
-def infer_service_date_from_rt(rt_df: pd.DataFrame) -> str:
-    ts = pd.concat([rt_df.get("rt_arrival_utc"), rt_df.get("rt_departure_utc")], ignore_index=True).dropna()
-    if ts.empty:
-        return datetime.utcnow().date().isoformat()
-    ts_local = ts.dt.tz_convert("America/New_York")
-    return ts_local.dt.date.min().isoformat()
-
-
 def build_stop_alias_map(stops_df: pd.DataFrame) -> dict:
+    """Map each stop_id to parent_station (or itself) for normalization."""
     alias = {}
     for _, r in stops_df.iterrows():
         sid = str(r["stop_id"])
@@ -104,8 +95,14 @@ def build_stop_alias_map(stops_df: pd.DataFrame) -> dict:
         alias[sid] = parent
     return alias
 
+def infer_service_date_from_rt(rt_df: pd.DataFrame) -> str:
+    ts = pd.concat([rt_df.get("rt_arrival_utc"), rt_df.get("rt_departure_utc")], ignore_index=True).dropna()
+    if ts.empty:
+        return datetime.utcnow().date().isoformat()
+    ts_local = ts.dt.tz_convert("America/New_York")
+    return ts_local.dt.date.min().isoformat()
 
-# ------------------- LOAD INPUTS --------------------------
+# ------------------- LOAD REALTIME -------------------------
 def load_realtime_events() -> pd.DataFrame:
     files = sorted(RT_DIR.glob("subway_rt_*.csv"))
     if not files:
@@ -147,7 +144,7 @@ def load_realtime_events() -> pd.DataFrame:
 
     return df
 
-
+# ------------------- LOAD STATIC (PENN) --------------------
 def load_scheduled_at_penn(service_date: str, penn_stop_ids: list) -> pd.DataFrame:
     zpath = latest_static_zip()
     print(f"[build_master] Using static file: {zpath.name}")
@@ -161,31 +158,30 @@ def load_scheduled_at_penn(service_date: str, penn_stop_ids: list) -> pd.DataFra
     penn_norm = {alias.get(str(s), str(s)) for s in penn_stop_ids}
 
     st = stop_times[stop_times["stop_id_norm"].isin(penn_norm)].copy()
-    st["Scheduled_Arrival"] = st["arrival_time"].astype(str).apply(lambda x: parse_gtfs_time_to_dt(x, service_date))
+    st["Scheduled_Arrival"]   = st["arrival_time"].astype(str).apply(lambda x: parse_gtfs_time_to_dt(x, service_date))
     st["Scheduled_Departure"] = st["departure_time"].astype(str).apply(lambda x: parse_gtfs_time_to_dt(x, service_date))
     st = st.merge(trips[["trip_id", "route_id"]], on="trip_id", how="left")
+
     cols = ["trip_id", "stop_id", "stop_id_norm", "route_id", "Scheduled_Arrival", "Scheduled_Departure"]
     return st[cols]
 
-
-# -------------------- ASOF PREP / SORT --------------------
+# -------------------- ASOF PREP/SORT -----------------------
 def _prep_for_asof(df: pd.DataFrame, ts_col: str, by_cols: list[str] | None = None) -> pd.DataFrame:
     """
     Prepare for merge_asof:
-      - cast key columns to consistent dtypes (strings for 'by', UTC datetimes for ts)
-      - drop rows with NaN/NaT in any join key
+      - cast 'by' columns to string (avoid mixed-type ordering)
+      - cast ts_col to tz-aware UTC datetime
+      - drop rows with NaN/NaT in join keys
       - stable lexicographic sort by by_cols then ts_col
     """
     if df is None or df.empty:
         return df.copy() if df is not None else pd.DataFrame()
-
     df = df.copy()
 
-    # normalize 'by' columns to string to avoid mixed-type ordering weirdness
+    # normalize 'by' columns to string
     if by_cols:
         for c in by_cols:
             df[c] = df[c].astype(str)
-
     if "stop_id_norm" in df.columns:
         df["stop_id_norm"] = df["stop_id_norm"].astype(str)
     if "route_id" in df.columns:
@@ -202,40 +198,10 @@ def _prep_for_asof(df: pd.DataFrame, ts_col: str, by_cols: list[str] | None = No
     drop_cols = (by_cols or []) + [ts_col]
     df = df.dropna(subset=drop_cols)
 
-    # STABLE lexicographic sort
+    # stable lexsort
     sort_cols = (by_cols or []) + [ts_col]
     df = df.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
     return df
-
-
-def _is_lexsorted(df: pd.DataFrame, ts_col: str, by_cols: list[str] | None = None) -> bool:
-    cols = (by_cols or []) + [ts_col]
-    if not cols:
-        return True
-    try:
-        idx = pd.MultiIndex.from_frame(df[cols])
-        return idx.is_monotonic_increasing
-    except Exception:
-        return False
-
-
-def _assert_sorted(df: pd.DataFrame, ts_col: str, by_cols: list[str] | None = None, label: str = "") -> None:
-    """Optional guard to fail fast with a clear message if sorting precondition breaks."""
-    if df is None or df.empty:
-        return
-    if by_cols:
-        bad_groups = []
-        for k, g in df.groupby(by_cols, dropna=False, sort=False):
-            if not g[ts_col].is_monotonic_increasing:
-                bad_groups.append(k)
-                if len(bad_groups) >= 5:
-                    break
-        if bad_groups:
-            raise ValueError(f"[asof-guard] {label}: time not sorted within groups for {ts_col}; bad groups (first 5): {bad_groups}")
-    else:
-        if not df[ts_col].is_monotonic_increasing:
-            raise ValueError(f"[asof-guard] {label}: {ts_col} not globally sorted.")
-
 
 def _group_keys_intersection(left: pd.DataFrame, right: pd.DataFrame, by_cols: list[str]) -> pd.DataFrame:
     """Return unique key tuples that exist in BOTH left and right."""
@@ -245,7 +211,6 @@ def _group_keys_intersection(left: pd.DataFrame, right: pd.DataFrame, by_cols: l
     rkeys = right[by_cols].drop_duplicates()
     both = lkeys.merge(rkeys, on=by_cols, how="inner")
     return both
-
 
 def _groupwise_asof(
     left: pd.DataFrame,
@@ -259,15 +224,12 @@ def _groupwise_asof(
 ) -> pd.DataFrame:
     """
     Perform pd.merge_asof per (by_cols) group, then concat.
-    This avoids pandas' global 'keys must be sorted' error because each mini-merge
-    is trivially sorted on its own subset.
+    Avoids global 'keys must be sorted' pitfalls by sorting within each group.
     """
     if left.empty or right.empty:
         return pd.DataFrame()
 
-    keys = _group_keys_intersection(left, right, by_cols)
-    out = []
-
+    # No grouping: simple single merge
     if not by_cols:
         l = left.sort_values([left_on], kind="mergesort").reset_index(drop=True)
         r = right.sort_values([right_on], kind="mergesort").reset_index(drop=True)
@@ -277,6 +239,10 @@ def _groupwise_asof(
             direction=direction, tolerance=tolerance,
             allow_exact_matches=allow_exact_matches
         )
+
+    # Grouped case: only iterate keys present on both sides
+    keys = _group_keys_intersection(left, right, by_cols)
+    out = []
 
     for _, keyrow in keys.iterrows():
         lmask = pd.Series(True, index=left.index)
@@ -306,7 +272,6 @@ def _groupwise_asof(
         return pd.DataFrame(columns=list(set(left.columns) | set(right.columns)))
     return pd.concat(out, ignore_index=True)
 
-
 # -------------------- TIME-BASED MATCH --------------------
 def join_static_with_rt_time_based(sched_df: pd.DataFrame, rt_df: pd.DataFrame, tolerance_min: int = 30) -> pd.DataFrame:
     """
@@ -315,67 +280,56 @@ def join_static_with_rt_time_based(sched_df: pd.DataFrame, rt_df: pd.DataFrame, 
     """
     tol = pd.Timedelta(minutes=tolerance_min)
 
-    # Defensive column checks
-    for needed in ["trip_id","stop_id","stop_id_norm","route_id","Scheduled_Arrival","Scheduled_Departure"]:
-        if needed not in sched_df.columns:
-            raise KeyError(f"[join] sched_df missing: {needed}")
+    # Required columns
+    for col in ["trip_id","stop_id","stop_id_norm","route_id","Scheduled_Arrival","Scheduled_Departure"]:
+        if col not in sched_df.columns:
+            raise KeyError(f"[join] sched_df missing: {col}")
+    for col in ["trip_id","stop_id","stop_id_norm","route_id"]:
+        if col not in rt_df.columns:
+            raise KeyError(f"[join] rt_df missing: {col}")
+    # rt arrival/dep can be partially missing, handled below
 
-    for needed in ["trip_id","stop_id","stop_id_norm","route_id","rt_arrival_utc","rt_departure_utc"]:
-        if needed not in rt_df.columns and needed not in ("rt_arrival_utc","rt_departure_utc"):
-            raise KeyError(f"[join] rt_df missing: {needed}")
-
-    # Build slim views (avoid _x/_y; only left carries IDs)
-    rtA_full = rt_df[["trip_id","stop_id","stop_id_norm","route_id","rt_arrival_utc"]].rename(columns={"rt_arrival_utc":"RT_Arrival"})
-    rtD_full = rt_df[["trip_id","stop_id","stop_id_norm","route_id","rt_departure_utc"]].rename(columns={"rt_departure_utc":"RT_Departure"})
-    schedA_full = sched_df[["stop_id_norm","route_id","Scheduled_Arrival"]]  # no IDs here
-    schedD_full = sched_df[["stop_id_norm","route_id","Scheduled_Departure"]]
-
-    # Choose grouping keys present on both sides
+    # Choose grouping keys present on both sides (keep names EXACT)
     candidate_by = ["stop_id_norm", "route_id"]
-    by_cols = [c for c in candidate_by if c in schedA_full.columns and c in rtA_full.columns]
+    by_cols = [c for c in candidate_by if c in sched_df.columns and c in rt_df.columns]
 
-    # Debug
-    print(f"[join] by_cols={by_cols}  rtA={len(rtA_full)}  schedA={len(schedA_full)}  rtD={len(rtD_full)}  schedD={len(schedD_full)}")
+    # Build slim FULL views that include by_cols; DO NOT rename by_cols
+    rtA_full    = rt_df[by_cols + ["trip_id","stop_id","stop_id_norm","route_id","rt_arrival_utc"]].rename(columns={"rt_arrival_utc":"RT_Arrival"})
+    rtD_full    = rt_df[by_cols + ["trip_id","stop_id","stop_id_norm","route_id","rt_departure_utc"]].rename(columns={"rt_departure_utc":"RT_Departure"})
+    schedA_full = sched_df[by_cols + ["Scheduled_Arrival"]]
+    schedD_full = sched_df[by_cols + ["Scheduled_Departure"]]
 
-    # Prepare both sides (casts, drops, stable sort)
-    rtA = _prep_for_asof(rtA_full, "RT_Arrival", by_cols)
-    rtD = _prep_for_asof(rtD_full, "RT_Departure", by_cols)
-    schedA = _prep_for_asof(schedA_full, "Scheduled_Arrival", by_cols)
+    # Prep (casts, drops, stable sort)
+    rtA    = _prep_for_asof(rtA_full,    "RT_Arrival",          by_cols)
+    rtD    = _prep_for_asof(rtD_full,    "RT_Departure",        by_cols)
+    schedA = _prep_for_asof(schedA_full, "Scheduled_Arrival",   by_cols)
     schedD = _prep_for_asof(schedD_full, "Scheduled_Departure", by_cols)
 
-    # Guards
-    _assert_sorted(rtA, "RT_Arrival", by_cols, label="rtA")
-    _assert_sorted(schedA, "Scheduled_Arrival", by_cols, label="schedA")
-    _assert_sorted(rtD, "RT_Departure", by_cols, label="rtD")
-    _assert_sorted(schedD, "Scheduled_Departure", by_cols, label="schedD")
-
-    if not _is_lexsorted(rtA, "RT_Arrival", by_cols):
-        raise ValueError("rtA not lexsorted by by_cols + RT_Arrival")
-    if not _is_lexsorted(schedA, "Scheduled_Arrival", by_cols):
-        raise ValueError("schedA not lexsorted by by_cols + Scheduled_Arrival")
-    if not _is_lexsorted(rtD, "RT_Departure", by_cols):
-        raise ValueError("rtD not lexsorted by by_cols + RT_Departure")
-    if not _is_lexsorted(schedD, "Scheduled_Departure", by_cols):
-        raise ValueError("schedD not lexsorted by by_cols + Scheduled_Departure")
-
-    # Groupwise asof (left=RT, right=Schedule)
-    # Arrival: keep IDs only on left to avoid suffix mess
-    leftA = rtA[by_cols + ["RT_Arrival","trip_id","stop_id","stop_id_norm","route_id"]].rename(
-        columns={"trip_id":"trip_id_arr","stop_id":"stop_id_arr","route_id":"route_id_arr"}
+    # Final slim views for groupwise asof (preserve by_cols; only rename non-by IDs)
+    leftA  = rtA[by_cols + ["RT_Arrival","trip_id","stop_id"]].rename(
+        columns={"trip_id":"trip_id_arr","stop_id":"stop_id_arr"}
     )
     rightA = schedA[by_cols + ["Scheduled_Arrival"]]
 
+    leftD  = rtD[by_cols + ["RT_Departure","trip_id","stop_id"]].rename(
+        columns={"trip_id":"trip_id_dep","stop_id":"stop_id_dep"}
+    )
+    rightD = schedD[by_cols + ["Scheduled_Departure"]]
+
+    # Quick sanity: by_cols must be on all sides
+    for side_name, frame in [("leftA", leftA), ("rightA", rightA), ("leftD", leftD), ("rightD", rightD)]:
+        missing = [c for c in by_cols if c not in frame.columns]
+        if missing:
+            raise KeyError(f"[join] {side_name} missing by_cols {missing}; has {list(frame.columns)}")
+
+    print(f"[join] by_cols={by_cols}  rtA={len(rtA)}  schedA={len(schedA)}  rtD={len(rtD)}  schedD={len(schedD)}")
+
+    # Groupwise asof (left=RT, right=Schedule)
     a = _groupwise_asof(
         left=leftA, right=rightA,
         left_on="RT_Arrival", right_on="Scheduled_Arrival",
         by_cols=by_cols, tolerance=tol, direction="nearest", allow_exact_matches=True
     ) if not (leftA.empty or rightA.empty) else pd.DataFrame()
-
-    # Departure
-    leftD = rtD[by_cols + ["RT_Departure","trip_id","stop_id","stop_id_norm","route_id"]].rename(
-        columns={"trip_id":"trip_id_dep","stop_id":"stop_id_dep","route_id":"route_id_dep"}
-    )
-    rightD = schedD[by_cols + ["Scheduled_Departure"]]
 
     d = _groupwise_asof(
         left=leftD, right=rightD,
@@ -391,17 +345,16 @@ def join_static_with_rt_time_based(sched_df: pd.DataFrame, rt_df: pd.DataFrame, 
             "Scheduled_Departure","RT_Departure","Departure_Delay_Min"
         ])
 
-    # ----------------- Combine arrivals & departures robustly -----------------
+    # ----------------- Combine arrivals & departures -----------------
     # Prefer by_cols for merge keys
     merge_keys = [k for k in (by_cols or []) if (k in a.columns) and (k in d.columns)]
     if not merge_keys:
-        # last resort; should not happen with the slim frames above
+        # unlikely with the slim setup; keep a safe fallback
         if not a.empty: a = a.copy(); a["_const"] = 1
         if not d.empty: d = d.copy(); d["_const"] = 1
         merge_keys = ["_const"]
 
     print(f"[combine] merge_keys={merge_keys}  a_cols={list(a.columns)[:8]}...  d_cols={list(d.columns)[:8]}...")
-
     out = pd.merge(a, d, on=merge_keys, how="outer", suffixes=("_arr","_dep"), copy=False)
 
     # Ensure arrival/departure timestamp columns exist
@@ -409,7 +362,7 @@ def join_static_with_rt_time_based(sched_df: pd.DataFrame, rt_df: pd.DataFrame, 
         if col not in out.columns:
             out[col] = pd.NaT
 
-    # Coalesce IDs
+    # Coalesce IDs (route_id & stop_id_norm are in by_cols, so already present)
     def _coalesce(cols):
         ser = pd.Series(pd.NA, index=out.index, dtype="object")
         for c in cols:
@@ -418,10 +371,10 @@ def join_static_with_rt_time_based(sched_df: pd.DataFrame, rt_df: pd.DataFrame, 
         return ser
 
     out["trip_id"]  = _coalesce(["trip_id_arr", "trip_id_dep", "trip_id"])
-    out["route_id"] = _coalesce(["route_id_arr","route_id_dep","route_id"])
+    out["route_id"] = _coalesce(["route_id"])  # from by_cols
     out["stop_id"]  = _coalesce(["stop_id_arr","stop_id_dep","stop_id"])
     if "stop_id_norm" not in out.columns:
-        out["stop_id_norm"] = _coalesce(["stop_id_norm"])  # present via by_cols
+        out["stop_id_norm"] = _coalesce(["stop_id_norm"])  # from by_cols
 
     # Delays
     out["Arrival_Delay_Min"] = (
@@ -443,8 +396,7 @@ def join_static_with_rt_time_based(sched_df: pd.DataFrame, rt_df: pd.DataFrame, 
         if c not in out.columns:
             out[c] = pd.NA
     out = out[keep]
-    return out  # <<< IMPORTANT
-
+    return out
 
 # --------------- INTERFACE CONSTRUCTION -------------------
 def build_interfaces_123_ace(events_df: pd.DataFrame) -> pd.DataFrame:
@@ -526,7 +478,6 @@ def build_interfaces_123_ace(events_df: pd.DataFrame) -> pd.DataFrame:
 
     return pd.DataFrame(out_rows)
 
-
 # ---------------- TIME FEATURES & FIELDS ------------------
 def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty: return df
@@ -543,7 +494,6 @@ def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
         categories=["AM peak", "PM peak", "Off-peak"]
     )
     return df
-
 
 def add_placeholders_and_scores(df: pd.DataFrame) -> pd.DataFrame:
     for col in ["Arrival_Delay_Min", "Departure_Delay_Min"]:
@@ -563,9 +513,10 @@ def add_placeholders_and_scores(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = pd.NA
     return df
 
-
 # ---------------------- MAIN ------------------------------
 def main():
+    print("[t0] starting build_master")
+
     # Load config for the Penn stops
     if not CONFIG_PATH.exists():
         raise FileNotFoundError("Missing config/penn_stops.json")
@@ -718,7 +669,6 @@ def main():
         print(f"[build_master] Parquet write skipped: {e}")
 
     print(f"[build_master] Wrote {len(interfaces)} rows → {roll_csv} / {roll_parq}")
-
 
 if __name__ == "__main__":
     main()
