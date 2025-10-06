@@ -45,18 +45,50 @@ PM_PEAK = range(16, 20)  # 16–19 local
 
 # ----------------------- ROUTE GROUPS ----------------------
 # Map route_id → coarse node for interface edges (tune as needed)
+# Subway sets (unchanged)
 ROUTE_GROUPS = {
     "Subway_123": set(list("123") + ["4", "5", "6", "7", "S"]),
     "Subway_ACE": set(list("ACE")),
 }
 
+# --- NJT: conservative known line codes (you can expand as you see them in data) ---
+NJT_ROUTES = {
+    # Major lines commonly used in GTFS/ops
+    "NEC", "NJCL", "RVL", "ME", "MOBO", "M&E", "MNE", "PVL", "ACL", "RARV", "RBUS"
+}
+
+def _looks_like_njt(route_id: str) -> bool:
+    """
+    Heuristics to classify an NJT Rail route_id safely:
+    - In a known NJT list; or
+    - Short all-caps alpha codes 2–5 chars that NJT often uses (NEC, RVL, ME, etc.);
+    - Strings prefixed with 'NJT_' (if your NJT poller tags them).
+    """
+    rid = str(route_id or "")
+    if rid in NJT_ROUTES:
+        return True
+    if rid.startswith("NJT_"):
+        return True
+    if rid.isalpha() and rid.upper() == rid and 2 <= len(rid) <= 5:
+        # Keep this permissive but harmless: if it were a subway line (A,C,E) we catch it earlier
+        return rid not in ROUTE_GROUPS["Subway_ACE"] and rid not in ROUTE_GROUPS["Subway_123"]
+    return False
+
 def route_to_node(route_id: str) -> str:
     if pd.isna(route_id) or route_id is None:
         return "Subway_Unknown"
     rid = str(route_id)
+
+    # Subway buckets (existing behavior first)
     for node, routes in ROUTE_GROUPS.items():
         if rid in routes:
             return node
+
+    # NJT bucket (new)
+    if _looks_like_njt(rid):
+        return "NJT_Rail"
+
+    # Fallbacks
     return "Subway_Other"
 
 # ------------------- STATIC TIME PARSING -------------------
@@ -243,7 +275,6 @@ def _groupwise_asof(
     if not by_cols:
         l = left.sort_values([left_on], kind="mergesort").reset_index(drop=True)
         r = right.sort_values([right_on], kind="mergesort").reset_index(drop=True)
-        # drop by_cols from right to prevent key suffixes (_x/_y)
         r = r.drop(columns=[c for c in by_cols if c in r.columns])
         return pd.merge_asof(
             l, r,
@@ -271,7 +302,6 @@ def _groupwise_asof(
 
         lg = lg.sort_values([left_on], kind="mergesort").reset_index(drop=True)
         rg = rg.sort_values([right_on], kind="mergesort").reset_index(drop=True)
-        # drop by_cols from right group to prevent key suffixes (_x/_y)
         rg2 = rg.drop(columns=[c for c in by_cols if c in rg.columns])
 
         merged = pd.merge_asof(
@@ -333,23 +363,16 @@ def join_static_with_rt_time_based(sched_df: pd.DataFrame, rt_df: pd.DataFrame, 
             .rename(columns={"trip_id":"trip_id_dep","stop_id":"stop_id_dep"})
     rightD = schedD[_uniq_cols(by_cols, ["Scheduled_Departure"])]
 
-    # (Optional safety asserts — helpful in CI logs)
-    assert leftA.columns.is_unique and rightA.columns.is_unique and leftD.columns.is_unique and rightD.columns.is_unique, \
-        "[join] got duplicate column labels after slimming; check by_cols/rename logic"
-
-    # Quick sanity: by_cols must be on all sides and columns must be unique
+    # Sanity
     for side_name, frame in [("leftA", leftA), ("rightA", rightA), ("leftD", leftD), ("rightD", rightD)]:
-        # 1) columns unique
         if not frame.columns.is_unique:
             dupes = frame.columns[frame.columns.duplicated()].tolist()
             raise ValueError(f"[join] {side_name} has duplicate columns: {dupes}. cols={list(frame.columns)}")
-        # 2) by_cols present
         missing = [c for c in by_cols if c not in frame.columns]
         if missing:
             raise KeyError(f"[join] {side_name} missing by_cols {missing}; has {list(frame.columns)}")
 
     print(f"[join] by_cols={by_cols}  rtA={len(rtA)}  schedA={len(schedA)}  rtD={len(rtD)}  schedD={len(schedD)}")
-
 
     # Groupwise asof (left=RT, right=Schedule)
     a = _groupwise_asof(
@@ -373,7 +396,6 @@ def join_static_with_rt_time_based(sched_df: pd.DataFrame, rt_df: pd.DataFrame, 
         ])
 
     # ----------------- Combine arrivals & departures -----------------
-    # Prefer trip_id for a 1:1-ish pair; else use a 1-minute time bucket to avoid cartesian blow-ups
     a = a.copy(); d = d.copy()
     if "trip_id_arr" in a.columns and "trip_id_dep" in d.columns:
         a["trip_id"] = a["trip_id_arr"]
@@ -384,7 +406,7 @@ def join_static_with_rt_time_based(sched_df: pd.DataFrame, rt_df: pd.DataFrame, 
         d["rt_min_bucket"] = pd.to_datetime(d["RT_Departure"], utc=True, errors="coerce").dt.floor("min")
         merge_keys = [*(by_cols or []), "rt_min_bucket"]
 
-    print(f"[combine] merge_keys={merge_keys}  a_cols={list(a.columns)[:8]}...  d_cols={list(d.columns)[:8]}...")
+    print(f"[combine] merge_keys={merge_keys}")
 
     out = pd.merge(a, d, on=merge_keys, how="outer", suffixes=("_arr","_dep"), copy=False)
 
@@ -393,7 +415,7 @@ def join_static_with_rt_time_based(sched_df: pd.DataFrame, rt_df: pd.DataFrame, 
         if col not in out.columns:
             out[col] = pd.NaT
 
-    # Coalesce IDs (route_id & stop_id_norm are in by_cols, so already present)
+    # Coalesce IDs
     def _coalesce(cols):
         ser = pd.Series(pd.NA, index=out.index, dtype="object")
         for c in cols:
@@ -438,8 +460,10 @@ def build_interfaces_123_ace(events_df: pd.DataFrame) -> pd.DataFrame:
     df["From_Node"] = df["route_id"].apply(route_to_node)
 
     def other(node: str) -> str | None:
+        # Subway↔Subway pairing (existing)
         if node == "Subway_123": return "Subway_ACE"
         if node == "Subway_ACE": return "Subway_123"
+        # NJT_Rail currently has no automatic pairing here; we’ll add explicit rail↔subway logic later
         return None
 
     df["Target_Node"] = df["From_Node"].apply(other)
@@ -548,7 +572,7 @@ def add_placeholders_and_scores(df: pd.DataFrame) -> pd.DataFrame:
 def main():
     print("[t0] starting build_master")
 
-    # Load config for the Penn stops
+    # Load config for the Penn stops (subway list used; NJT will be added later in a rail join)
     if not CONFIG_PATH.exists():
         raise FileNotFoundError("Missing config/penn_stops.json")
     cfg = json.loads(CONFIG_PATH.read_text())
@@ -565,7 +589,7 @@ def main():
         service_date = SERVICE_DATE_OVERRIDE
     print(f"[build_master] Using service_date: {service_date}")
 
-    # Static scheduled rows for Penn
+    # Static scheduled rows for Penn (subway GTFS)
     sched = load_scheduled_at_penn(service_date, penn_ids)
 
     # Filter static to RT time window ±60 min (if RT has timestamps)
@@ -615,7 +639,7 @@ def main():
     print("[build_master] Preview of merged columns:")
     print(events_at_penn[required].head(8))
 
-    # Build interfaces
+    # Build interfaces (Subway↔Subway today; NJT classification now works, pairing to be added later)
     interfaces = build_interfaces_123_ace(events_at_penn)
     interfaces = add_time_features(interfaces)
     interfaces = add_placeholders_and_scores(interfaces)
