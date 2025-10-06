@@ -21,6 +21,17 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
+      # --- Cache token file daily ---
+      - name: Cache NJT token
+        id: token_cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.njt/token.json
+          key: njt-token-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            njt-token-
+
+      # --- Run NJT Rail poller with cached token ---
       - name: Run NJT Rail poller
         env:
           NJT_ENV: "prod"            # or "test" while you iterate
@@ -31,6 +42,7 @@ jobs:
           TZ: "UTC"
           PYTHONUNBUFFERED: "1"
         run: |
+          mkdir -p ~/.njt
           python pollers/njt_realtime_rail.py
 
       - name: Upload realtime CSVs (artifact)
