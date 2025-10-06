@@ -32,10 +32,9 @@ jobs:
 
       - name: Download NJT GTFS static
         env:
-          NJT_GTFS_STATIC_URL: ${{ vars.NJT_GTFS_STATIC_URL }}
-        run: |
-          python pollers/njt_static_refresh.py
-          ls -lh gtfs_static_njt
+          NJT_GTFS_STATIC_URL: ${{ secrets.NJT_GTFS_STATIC_URL }}
+        run: python pollers/njt_static_refresh.py
+
 
       - name: Upload static as artifact
         uses: actions/upload-artifact@v4
