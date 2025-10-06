@@ -337,12 +337,12 @@ def join_static_with_rt_time_based(sched_df: pd.DataFrame, rt_df: pd.DataFrame, 
     for side_name, frame in [("leftA", leftA), ("rightA", rightA), ("leftD", leftD), ("rightD", rightD)]:
         # 1) columns unique
         if not frame.columns.is_unique:
-        dupes = frame.columns[frame.columns.duplicated()].tolist()
-        raise ValueError(f"[join] {side_name} has duplicate columns: {dupes}. cols={list(frame.columns)}")
-    # 2) by_cols present
-    missing = [c for c in by_cols if c not in frame.columns]
-    if missing:
-        raise KeyError(f"[join] {side_name} missing by_cols {missing}; has {list(frame.columns)}")
+            dupes = frame.columns[frame.columns.duplicated()].tolist()
+            raise ValueError(f"[join] {side_name} has duplicate columns: {dupes}. cols={list(frame.columns)}")
+        # 2) by_cols present
+        missing = [c for c in by_cols if c not in frame.columns]
+        if missing:
+            raise KeyError(f"[join] {side_name} missing by_cols {missing}; has {list(frame.columns)}")
 
     print(f"[join] by_cols={by_cols}  rtA={len(rtA)}  schedA={len(schedA)}  rtD={len(rtD)}  schedD={len(schedD)}")
 
