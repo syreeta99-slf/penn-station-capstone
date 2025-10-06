@@ -1,8 +1,4 @@
 {
-  "subway_penn_stops": [    
-    "128N", "128S", 
-	"255N", "255S", 
-	"726N", "726S", 
-	"A28N", "A28S"
-  ]
+  "subway_penn_stops": ["128N", "128S", "255N", "255S", "726N", "726S", "A28N", "A28S"],
+  "njt_penn_stops": ["105"]  
 }
