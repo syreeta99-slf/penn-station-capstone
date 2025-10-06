@@ -243,6 +243,8 @@ def _groupwise_asof(
     if not by_cols:
         l = left.sort_values([left_on], kind="mergesort").reset_index(drop=True)
         r = right.sort_values([right_on], kind="mergesort").reset_index(drop=True)
+        # drop by_cols from right to prevent key suffixes (_x/_y)
+        r = r.drop(columns=[c for c in by_cols if c in r.columns])
         return pd.merge_asof(
             l, r,
             left_on=left_on, right_on=right_on,
@@ -269,9 +271,11 @@ def _groupwise_asof(
 
         lg = lg.sort_values([left_on], kind="mergesort").reset_index(drop=True)
         rg = rg.sort_values([right_on], kind="mergesort").reset_index(drop=True)
+        # drop by_cols from right group to prevent key suffixes (_x/_y)
+        rg2 = rg.drop(columns=[c for c in by_cols if c in rg.columns])
 
         merged = pd.merge_asof(
-            lg, rg,
+            lg, rg2,
             left_on=left_on, right_on=right_on,
             direction=direction, tolerance=tolerance,
             allow_exact_matches=allow_exact_matches
