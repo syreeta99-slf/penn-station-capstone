@@ -682,6 +682,21 @@ def main():
     if SERVICE_DATE_OVERRIDE:
         service_date = SERVICE_DATE_OVERRIDE
     print(f"[build_master] Using service_date: {service_date}")
+    
+    # Subway scheduled @ Penn
+    sched_sub = load_scheduled_at_penn(service_date, subway_ids)
+
+    # NJT scheduled @ Penn (if present)
+    try:
+        sched_njt = load_scheduled_njt_at_penn(service_date, njt_ids) if njt_ids else pd.DataFrame()
+    except FileNotFoundError:
+        print("[build_master] NJT static not found; continuing subway-only.")
+        sched_njt = pd.DataFrame()
+
+    # Union scheduled
+    sched = pd.concat([sched_sub, sched_njt], ignore_index=True) if not sched_njt.empty else sched_sub
+
+    # (keep) filter 'sched' to RT window ±60 min (your existing code)
 
     # Static scheduled rows for Penn (subway GTFS)
     sched = load_scheduled_at_penn(service_date, penn_ids)
@@ -708,6 +723,32 @@ def main():
 
     # Time-based merge (nearest within tolerance)
     events_at_penn = join_static_with_rt_time_based(sched, rt, tolerance_min=30)
+
+    # ---------- BUILD INTERFACES ----------
+    # 1) Subway↔Subway (123 ↔ ACE)
+    interfaces_sub = build_interfaces_123_ace(events_at_penn)
+
+    # 2) NJT Rail → Subway (requires build_interfaces_rail_to_subway helper)
+    interfaces_rail = build_interfaces_rail_to_subway(events_at_penn)
+
+    # 3) Combine both sets
+    interfaces = pd.concat([interfaces_sub, interfaces_rail], ignore_index=True)
+
+    # 4) Optional: exact de-dup (same arrival/departure pair shows up twice)
+    before = len(interfaces)
+    interfaces = interfaces.drop_duplicates(
+        subset=[
+            "From_Node","To_Node","Link_Type",
+            "Scheduled_Arrival","RT_Arrival",
+            "Scheduled_Departure","RT_Departure"
+        ],
+        keep="first"
+    )
+    print(f"[build_master] De-dup interfaces: {before} → {len(interfaces)}")
+
+    # 5) Enrich with time features and placeholders/scores
+    interfaces = add_time_features(interfaces)
+    interfaces = add_placeholders_and_scores(interfaces)
 
     # Simple QC preview
     total_sched = len(sched)
