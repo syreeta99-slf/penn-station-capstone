@@ -1,9 +1,6 @@
 name: NJT Rail GTFS-RT poller
 
 on:
-  schedule:
-    # poll every 5 minutes (safer for logs/quotas)
-    - cron: "*/5 * * * *"
   workflow_dispatch: {}
 
 jobs:
