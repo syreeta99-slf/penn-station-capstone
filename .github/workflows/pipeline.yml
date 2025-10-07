@@ -102,19 +102,24 @@ jobs:
           mkdir -p ~/.config/rclone
           echo "${{ secrets.RCLONE_CONF_B64 }}" | base64 -d > ~/.config/rclone/rclone.conf
           chmod 600 ~/.config/rclone/rclone.conf
-          rclone listremotes
-          rclone about "${{ env.GDRIVE_REMOTE_NAME }}:" || (echo "Drive remote not reachable"; exit 1)
 
-      # ===== PRE-SYNC: pull current master from Drive so we can append =====
+      - name: Verify Drive remote connectivity
+        run: |
+          rclone listremotes
+          # Must match your env.GDRIVE_REMOTE_NAME (e.g. "googledrive:")
+          rclone about "${{ env.GDRIVE_REMOTE_NAME }}:" || (echo "::error::Drive remote not reachable"; exit 1)
+
+      # ===== PRE-SYNC: pull current master so we can append locally =====
       - name: Pull prior master from Drive
         run: |
           mkdir -p data/curated
           rclone lsd "${{ env.GDRIVE_REMOTE_NAME }}:${{ env.GDRIVE_DIR }}" || true
           rclone copy "${{ env.GDRIVE_REMOTE_NAME }}:${{ env.GDRIVE_DIR }}" data/curated \
-            --include "master_interface_dataset.csv" \
-            --include "master_interface_dataset.parquet" \
-            --max-depth 1 --ignore-existing || true
+          --include "master_interface_dataset.csv" \
+          --include "master_interface_dataset.parquet" \
+          --max-depth 1 --ignore-existing || true
           ls -lh data/curated || true
+
 
       # ===== Poll realtime (MTA Subway) =====
       - name: Run MTA realtime poller
