@@ -35,7 +35,8 @@ CONFIG_PATH = ROOT / "config" / "penn_stops.json"
 CURATED_DIR.mkdir(parents=True, exist_ok=True)
 
 # Env knobs
-RT_DIR = Path(os.getenv("RT_DIR", str(REALTIME_DIR)))  # existing MTA subway RT dir (data/realtime)
+MTA_RT_DIR = Path(os.getenv("MTA_RT_DIR", str(REALTIME_DIR)))  # MTA subway RT dir (default data/realtime)
+RT_DIR = MTA_RT_DIR  # backward-compat alias for the rest of the script
 MTA_RT_GLOB = os.getenv("MTA_RT_GLOB", "subway_rt_*.csv")
 NJT_RT_DIR = Path(os.getenv("NJT_RT_DIR", "data/njt_rt"))  # NEW: where NJT poller writes
 NJT_RT_GLOB = os.getenv("NJT_RT_GLOB", "njt_rt_*.csv")
