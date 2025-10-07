@@ -38,6 +38,9 @@ PASSWORD = os.getenv("NJT_PASSWORD", "")
 OUT_DIR = pathlib.Path(os.getenv("NJT_RT_DIR", "data/njt_rt"))
 TOKEN_DIR = pathlib.Path(os.getenv("NJT_TOKEN_DIR", str(pathlib.Path.home() / ".njt")))
 TOKEN_PATH = TOKEN_DIR / "token.json"
+TOKEN_PATH_ENV = os.getenv("NJT_TOKEN_PATH", "").strip()
+if TOKEN_PATH_ENV:
+    TOKEN_PATH = pathlib.Path(os.path.expanduser(TOKEN_PATH_ENV))
 
 FILTER_IDS_RAW = os.getenv("NJT_FILTER_STOP_IDS", "105")
 FILTER_STOP_IDS: Set[str] = {s.strip() for s in FILTER_IDS_RAW.split(",") if s.strip()}
@@ -61,27 +64,35 @@ log = logging.getLogger("njt")
 # Token cache helpers
 # -----------------------------
 def read_cached_token() -> Optional[str]:
+    """Read token from disk. Log if we are going to reuse it."""
     try:
         if TOKEN_PATH.exists():
-            txt = TOKEN_PATH.read_text(encoding="utf-8").strip()
-            if txt:
-                return json.loads(txt).get("token")
-    except Exception:
-        pass
+            raw = TOKEN_PATH.read_text(encoding="utf-8").strip()
+            if raw:
+                data = json.loads(raw)
+                tok = data.get("token")
+                saved = data.get("saved_utc")
+                if tok:
+                    log.info(f"Using cached token (saved_utc={saved}) from {TOKEN_PATH}")
+                    return tok
+    except Exception as e:
+        log.warning(f"Could not read cached token: {e}")
     return None
 
 def write_cached_token(token: str) -> None:
+    """Atomic write to avoid partial files on ephemeral runners."""
     TOKEN_DIR.mkdir(parents=True, exist_ok=True)
-    TOKEN_PATH.write_text(
-        json.dumps({"token": token, "saved_utc": dt.datetime.utcnow().isoformat()}),
-        encoding="utf-8",
-    )
-
+    tmp = TOKEN_PATH.with_suffix(".tmp")
+    payload = {"token": token, "saved_utc": dt.datetime.utcnow().isoformat()}
+    tmp.write_text(json.dumps(payload), encoding="utf-8")
+    tmp.replace(TOKEN_PATH)  # atomic on POSIX
+    
 def clear_cached_token() -> None:
     try:
         TOKEN_PATH.unlink(missing_ok=True)
-    except Exception:
-        pass
+        log.info(f"Cleared cached token at {TOKEN_PATH}")
+    except Exception as e:
+        log.warning(f"Could not clear cached token: {e}")
 
 def request_new_token() -> Tuple[Optional[str], str]:
     """Return (token_or_none, status_tag) where status_tag is 'ok', 'daily_limit', or 'error'."""
@@ -206,7 +217,7 @@ def main() -> None:
         log.error("Missing NJT_USERNAME or NJT_PASSWORD.")
         sys.exit(1)
 
-    # 1) Try cached token
+    # 1) Try cached token first (no validation call)
     token = read_cached_token()
     tried_refresh = False
 
@@ -217,7 +228,7 @@ def main() -> None:
             if status == "ok":
                 token = new_token
                 write_cached_token(token)
-                log.info("Acquired new token.")
+                log.info("Acquired new token (no cached token present).")
             elif status == "daily_limit":
                 log.info("Daily token limit reached; skipping until next UTC day.")
                 sys.exit(0)
@@ -242,7 +253,7 @@ def main() -> None:
             clear_cached_token()
             token = None
             tried_refresh = True
-            continue  # loop will request fresh token
+            continue  # retry with new token
         elif status_code in (429, 500) and "daily usage limit" in preview.lower():
             log.info(preview.strip())
             log.info("Daily token limit hit when fetching data; skipping.")
