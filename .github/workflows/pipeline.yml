@@ -168,6 +168,7 @@ jobs:
           NJT_USERNAME: ${{ secrets.NJT_USERNAME }}
           NJT_PASSWORD: ${{ secrets.NJT_PASSWORD }}
           NJT_TOKEN_DIR: ~/.njt
+          NJT_TOKEN_PATH: ~/.njt/token.json
           NJT_RT_DIR: ${{ env.NJT_RT_DIR }}
           NJT_ENV: ${{ env.NJT_ENV }}
           # Optional: enforce Penn-only rows from the poller (already default)
