@@ -201,8 +201,6 @@ def load_realtime_union_mta_njt() -> pd.DataFrame:
         print(f"[build_master] De-dup RT (trip/stop/min): {before} → {len(df)}")
     return df
 
-print(f"[build_master] RT union sizes: MTA={len(_read_rt_glob(Path(MTA_RT_DIR), MTA_RT_GLOB))}  NJT={len(_read_rt_glob(Path(NJT_RT_DIR), NJT_RT_GLOB))}")
-
 
 # ------------------- LOAD STATIC (PENN) --------------------
 def load_scheduled_at_penn(service_date: str, penn_stop_ids: list) -> pd.DataFrame:
@@ -594,6 +592,12 @@ def main():
     if not subway_penn_ids:
         raise RuntimeError("'subway_penn_stops' is empty in config/penn_stops.json")
     njt_penn_ids = cfg.get("njt_penn_stops", [])  # optional
+
+    # Debug: show input row counts from both folders
+    mta_count = len(_read_rt_glob(Path(MTA_RT_DIR), MTA_RT_GLOB))
+    njt_count = len(_read_rt_glob(Path(NJT_RT_DIR), NJT_RT_GLOB))
+    print(f"[build_master] RT union sizes: MTA={mta_count}  NJT={njt_count}")
+  
 
     # Load union RT (MTA + NJT)
     rt = load_realtime_union_mta_njt()
