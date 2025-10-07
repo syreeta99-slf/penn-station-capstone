@@ -127,11 +127,27 @@ jobs:
         id: date
         run: echo "today=$(date -u +%F)" >> $GITHUB_OUTPUT
 
+      - name: Ensure NJT cache dir exists
+        run: mkdir -p ~/.njt
+
       - name: Cache NJT token (per UTC day)
         uses: actions/cache@v4
         with:
           path: ~/.njt
           key: njt-token-${{ steps.date.outputs.today }}
+
+      - name: Show cached token presence
+        run: |
+          echo "[debug] Listing ~/.njt:"
+          ls -la ~/.njt || true
+          if [ -f ~/.njt/token.json ]; then
+            echo "[debug] token.json found (size):"
+            wc -c ~/.njt/token.json
+            head -c 200 ~/.njt/token.json; echo
+          else
+            echo "[debug] token.json NOT present (will request once this run)"
+          fi
+          
 
       - name: Run NJT realtime poller
         env:
