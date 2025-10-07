@@ -144,6 +144,32 @@ def infer_service_date_from_rt(rt_df: pd.DataFrame) -> str:
     ts_local = ts.dt.tz_convert("America/New_York")
     return ts_local.dt.date.min().isoformat()
 
+def latest_njt_static_zip() -> Path:
+    zips = sorted(STATIC_DIR.glob("njt_rail_static*.zip")) or sorted(STATIC_DIR.glob("njt_rail_static.zip"))
+    if not zips:
+        raise FileNotFoundError("Place NJT GTFS static zip as gtfs_static/njt_rail_static.zip")
+    return zips[-1]
+
+def load_scheduled_njt_at_penn(service_date: str, njt_stop_ids: list) -> pd.DataFrame:
+    zpath = latest_njt_static_zip()
+    trips = read_txt_from_zip(zpath, "trips.txt")
+    stop_times = read_txt_from_zip(zpath, "stop_times.txt")
+    stops = read_txt_from_zip(zpath, "stops.txt")
+
+    # NJT has no parent_station on rail, so just pass-through
+    stop_times["stop_id_norm"] = stop_times["stop_id"].astype(str)
+
+    njt_norm = {str(s) for s in njt_stop_ids}
+    st = stop_times[stop_times["stop_id_norm"].isin(njt_norm)].copy()
+
+    st["Scheduled_Arrival"]   = st["arrival_time"].astype(str).apply(lambda x: parse_gtfs_time_to_dt(x, service_date))
+    st["Scheduled_Departure"] = st["departure_time"].astype(str).apply(lambda x: parse_gtfs_time_to_dt(x, service_date))
+    st = st.merge(trips[["trip_id", "route_id"]], on="trip_id", how="left")
+
+    # Tag that these rows are NJT (helps if you need to filter later)
+    st["route_id"] = st["route_id"].astype(str)
+    return st[["trip_id","stop_id","stop_id_norm","route_id","Scheduled_Arrival","Scheduled_Departure"]]
+
 # ------------------- LOAD REALTIME -------------------------
 def load_realtime_events() -> pd.DataFrame:
     files = sorted(RT_DIR.glob("subway_rt_*.csv"))
