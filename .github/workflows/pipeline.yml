@@ -131,9 +131,9 @@ jobs:
         run: mkdir -p ~/.njt
 
       # Restore/save the entire directory to ensure one token per UTC day
-      - name: Cache NJT token (per UTC day)
+      - name: Restore NJT token cache (per UTC day)
         id: cache_njt
-        uses: actions/cache@v4
+        uses: actions/cache/cache@v4
         with:
           path: ~/.njt
           key: njt-token-${{ steps.date.outputs.today }}
@@ -175,6 +175,13 @@ jobs:
         run: |
           mkdir -p "${{ env.NJT_RT_DIR }}"
           python pollers/njt_realtime_rail.py || true   # non-fatal if daily token limit
+
+      - name: Save NJT token cache if created (first run of the day)
+        if: steps.cache_njt.outputs.cache-hit != 'true' && hashFiles('~/.njt/token.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.njt
+          key: njt-token-${{ steps.date.outputs.today }}
 
       - name: Show NJT poller logs & directory
         run: |
