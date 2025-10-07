@@ -46,28 +46,51 @@ jobs:
       actions: read
 
     env:
-      # Your exact rclone remote name and Drive folder (quotes allow spaces)
+      # --- Google Drive sync target (your existing values) ---
       GDRIVE_REMOTE_NAME: "googledrive"
       GDRIVE_DIR: "penn-station/curated"
+
+      # --- Realtime input folders (used by build_master.py) ---
+      MTA_RT_DIR: data/realtime          # your subway poller writes here already
+      NJT_RT_DIR: data/njt_rt            # NJT poller will write here
+
+      # --- Output master path (used by the script internally as default too) ---
+      MASTER_OUT: data/curated/master_interface_dataset.csv
+
+      # --- Interface pairing controls (can be overridden via workflow_dispatch) ---
+      TOL_MIN: "15"
+      TRANSFER_WINDOW_MIN: "20"
+      MISSED_THRESHOLD_MIN: "2"
+
+      # --- Optional filters/overrides ---
+      # PENN_STOP_IDS: "A28,A27,PSNY"     # restrict to Penn by stop_ids if you want
+      # SERVICE_DATE: "2025-10-06"        # or let the script infer
+
+      # --- NJT API host (creds come from repo secrets in the step) ---
+      NJT_ENV: "prod"
+      NJT_BASE: "https://raildata.njtransit.com"
 
     steps:
       - uses: actions/checkout@v4
       
       - name: Ensure gtfs_static exists
-        run: mkdir -p gtfs_stat
+        run: mkdir -p gtfs_static
 
       - uses: actions/setup-python@v4
         with:
           python-version: "3.11"
 
       - name: Install Python deps
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Sanity check repo layout
         run: |
           echo "[repo] top-level:"; ls -lh
           test -f pollers/mta_realtime_subway.py || { echo "::error::pollers/mta_realtime_subway.py missing"; exit 1; }
           test -f pollers/build_master.py        || { echo "::error::pollers/build_master.py missing"; exit 1; }
+          test -f pollers/njt_realtime_rail.py   || { echo "::error::pollers/njt_realtime_rail.py missing"; exit 1; }
 
       # ===== rclone install & configure =====
       - name: Install rclone
@@ -94,17 +117,42 @@ jobs:
             --max-depth 1 --ignore-existing || true
           ls -lh data/curated || true
 
-      # ===== Poll realtime =====
-      - name: Run realtime poller
+      # ===== Poll realtime (MTA Subway) =====
+      - name: Run MTA realtime poller
         env:
           MTA_API_KEY: ${{ secrets.MTA_API_KEY }}
         run: python pollers/mta_realtime_subway.py
 
+      # ===== Poll realtime (NJT Rail) – normalized CSVs =====
+      - name: Compute UTC date key
+        id: date
+        run: echo "today=$(date -u +%F)" >> $GITHUB_OUTPUT
+
+      - name: Cache NJT token (per UTC day)
+        uses: actions/cache@v4
+        with:
+          path: ~/.njt/token.json
+          key: njt-token-${{ steps.date.outputs.today }}
+
+      - name: Run NJT realtime poller
+        env:
+          NJT_CLIENT_ID: ${{ secrets.NJT_CLIENT_ID }}
+          NJT_CLIENT_SECRET: ${{ secrets.NJT_CLIENT_SECRET }}
+          NJT_TOKEN_DIR: ~/.njt
+          NJT_RT_DIR: ${{ env.NJT_RT_DIR }}
+          NJT_ENV: ${{ env.NJT_ENV }}
+          NJT_BASE: ${{ env.NJT_BASE }}
+        run: |
+          mkdir -p "${{ env.NJT_RT_DIR }}"
+          python pollers/njt_realtime_rail.py || true   # non-fatal if daily token limit
+
       - name: Upload realtime CSVs (artifact)
         uses: actions/upload-artifact@v4
         with:
-          name: subway_realtime_csvs
-          path: data/realtime/*.csv
+          name: realtime_csvs
+          path: |
+            data/realtime/*.csv
+            data/njt_rt/*.csv
           retention-days: 3
 
       # ===== Ensure static GTFS present =====
@@ -126,17 +174,21 @@ jobs:
             python pollers/mta_static_refresh.py
           fi
 
-      # ===== Build & APPEND to rolling master =====
+      # ===== Build & APPEND to rolling master (now reads MTA + NJT RT) =====
       - name: Build master & append
         env:
           PYTHONUNBUFFERED: "1"
-          APPEND_TO_MASTER: "1"       # << always append moving forward
+          APPEND_TO_MASTER: "1"
           ALLOW_STATIC_REFRESH: "0"
-          RT_DIR: data/realtime
-          RT_MAX_FILES: ${{ inputs.rt_max_files || '120' }}
-          TRANSFER_WINDOW_MIN: ${{ inputs.transfer_window_min || '20' }}
-          MISSED_THRESHOLD_MIN: ${{ inputs.missed_threshold_min || '2' }}
+          # Paths and tuning (flow to build_master.py)
+          MTA_RT_DIR: ${{ env.MTA_RT_DIR }}
+          NJT_RT_DIR: ${{ env.NJT_RT_DIR }}
+          MASTER_OUT: ${{ env.MASTER_OUT }}
+          TOL_MIN: ${{ env.TOL_MIN }}
+          TRANSFER_WINDOW_MIN: ${{ inputs.transfer_window_min || env.TRANSFER_WINDOW_MIN }}
+          MISSED_THRESHOLD_MIN: ${{ inputs.missed_threshold_min || env.MISSED_THRESHOLD_MIN }}
           SERVICE_DATE: ${{ inputs.service_date || '' }}
+          # Optional: PENN_STOP_IDS: ${{ env.PENN_STOP_IDS }}
         run: |
           echo "[t0] starting build_master"
           python pollers/build_master.py
