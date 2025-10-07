@@ -133,7 +133,7 @@ jobs:
       # Restore/save the entire directory to ensure one token per UTC day
       - name: Restore NJT token cache (per UTC day)
         id: cache_njt
-        uses: actions/cache/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ~/.njt
           key: njt-token-${{ steps.date.outputs.today }}
@@ -177,7 +177,7 @@ jobs:
           python pollers/njt_realtime_rail.py || true   # non-fatal if daily token limit
 
       - name: Save NJT token cache if created (first run of the day)
-        if: steps.cache_njt.outputs.cache-hit != 'true' && hashFiles('~/.njt/token.json') != ''
+        if: steps.cache_njt.outputs.cache-hit != 'true' && steps.token_check.outputs.exists == 'true'
         uses: actions/cache/save@v4
         with:
           path: ~/.njt
