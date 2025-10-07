@@ -130,24 +130,38 @@ jobs:
       - name: Ensure NJT cache dir exists
         run: mkdir -p ~/.njt
 
+      # Restore/save the entire directory to ensure one token per UTC day
       - name: Cache NJT token (per UTC day)
+        id: cache_njt
         uses: actions/cache@v4
         with:
           path: ~/.njt
           key: njt-token-${{ steps.date.outputs.today }}
 
-      - name: Show cached token presence
+      - name: Show cached token presence (no secrets)
+        shell: bash
         run: |
+          echo "[debug] cache-hit=${{ steps.cache_njt.outputs.cache-hit }}"
           echo "[debug] Listing ~/.njt:"
           ls -la ~/.njt || true
           if [ -f ~/.njt/token.json ]; then
             echo "[debug] token.json found (size):"
             wc -c ~/.njt/token.json
-            head -c 200 ~/.njt/token.json; echo
+            # Write a tiny Python script without heredocs (YAML-safe)
+            printf '%s\n' \
+              'import json' \
+              'from pathlib import Path' \
+              'p = Path.home() / ".njt" / "token.json"' \
+              'try:' \
+              '    d = json.loads(p.read_text())' \
+              '    print("[debug] saved_utc:", d.get("saved_utc"))' \
+              'except Exception as e:' \
+              '    print("[debug] could not read saved_utc:", e)' \
+              > /tmp/print_saved_utc.py
+            python /tmp/print_saved_utc.py
           else
             echo "[debug] token.json NOT present (will request once this run)"
           fi
-          
 
       - name: Run NJT realtime poller
         env:
@@ -156,6 +170,8 @@ jobs:
           NJT_TOKEN_DIR: ~/.njt
           NJT_RT_DIR: ${{ env.NJT_RT_DIR }}
           NJT_ENV: ${{ env.NJT_ENV }}
+          # Optional: enforce Penn-only rows from the poller (already default)
+          # NJT_FILTER_STOP_IDS: "105"
         run: |
           mkdir -p "${{ env.NJT_RT_DIR }}"
           python pollers/njt_realtime_rail.py || true   # non-fatal if daily token limit
