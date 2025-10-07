@@ -146,6 +146,14 @@ jobs:
           mkdir -p "${{ env.NJT_RT_DIR }}"
           python pollers/njt_realtime_rail.py || true   # non-fatal if daily token limit
 
+      - name: Show NJT poller logs & directory
+        run: |
+          echo "NJT_RT_DIR=${{ env.NJT_RT_DIR }}"
+          ls -lh "${{ env.NJT_RT_DIR }}" || true
+          # Show the 5 most recent files (if any)
+          find "${{ env.NJT_RT_DIR }}" -maxdepth 1 -type f -printf "%TY-%Tm-%Td %TT %p\n" | sort | tail -n 5 || true
+
+
       - name: Upload realtime CSVs (artifact)
         uses: actions/upload-artifact@v4
         with:
@@ -173,6 +181,14 @@ jobs:
             echo "Refreshing static GTFS…"
             python pollers/mta_static_refresh.py
           fi
+
+
+      - name: Show MTA+NJT input counts before build
+        run: |
+          echo "[debug] MTA_RT_DIR=${{ env.MTA_RT_DIR }}"
+          echo "[debug] NJT_RT_DIR=${{ env.NJT_RT_DIR }}"
+          echo "[debug] MTA files:"; ls -lh "${{ env.MTA_RT_DIR }}" || true
+          echo "[debug] NJT files:"; ls -lh "${{ env.NJT_RT_DIR }}" || true
 
       # ===== Build & APPEND to rolling master (now reads MTA + NJT RT) =====
       - name: Build master & append
