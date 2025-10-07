@@ -266,13 +266,16 @@ jobs:
             data/curated/master_interface_dataset.parquet
           retention-days: 7
 
-      # ===== POST-SYNC: push updated master back to Drive =====
       - name: Push updated master to Drive
         run: |
+          test -f data/curated/master_interface_dataset.csv || { echo "::error::CSV not produced"; exit 1; }
+
+          # Copy just the two master files, always updating Drive if local is newer
           rclone copy data/curated "${{ env.GDRIVE_REMOTE_NAME }}:${{ env.GDRIVE_DIR }}" \
             --include "master_interface_dataset.csv" \
             --include "master_interface_dataset.parquet" \
-            --create-empty-src-dirs \
-            --transfers 4 --checkers 8 \
-            --drive-chunk-size 64M \
-            --update --progress
+            --update --transfers 4 --checkers 8 --retries 3 --low-level-retries 10
+
+          echo "[done] Drive listing after push:"
+          rclone ls "${{ env.GDRIVE_REMOTE_NAME }}:${{ env.GDRIVE_DIR }}" | sed -n '1,50p'
+
