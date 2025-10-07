@@ -558,6 +558,74 @@ def build_interfaces_123_ace(events_df: pd.DataFrame) -> pd.DataFrame:
         })
 
     return pd.DataFrame(out_rows)
+    
+def build_interfaces_rail_to_subway(events_df: pd.DataFrame) -> pd.DataFrame:
+    if events_df.empty:
+        return pd.DataFrame()
+
+    df = events_df.copy()
+    df["From_Node"] = df["route_id"].apply(route_to_node)
+    df["To_Node"]   = df["route_id"].apply(route_to_node)  # will be overwritten for departures below
+
+    # Best timestamps
+    df["Best_Arrival"]   = df["RT_Arrival"].combine_first(df["Scheduled_Arrival"])
+    df["Best_Departure"] = df["RT_Departure"].combine_first(df["Scheduled_Departure"])
+    df["Used_Scheduled_Fallback"] = df["RT_Arrival"].isna() | df["RT_Departure"].isna()
+
+    # Split arrivals (NJT) and departures (subway)
+    arrivals = df[(df["Best_Arrival"].notna()) & (df["From_Node"] == "NJT_Rail")].copy()
+    departures = df[df["Best_Departure"].notna()].copy()
+    departures["To_Node"] = departures["route_id"].apply(route_to_node)
+    departures = departures[departures["To_Node"].isin(["Subway_123","Subway_ACE"])]
+
+    out = []
+    for _, a in arrivals.iterrows():
+        # target is either 123 or ACE (try both, choose earliest departure)
+        cand = departures[
+            (departures["Best_Departure"] >= a["Best_Arrival"]) &
+            (departures["Best_Departure"] <= a["Best_Arrival"] + pd.Timedelta(minutes=TRANSFER_WINDOW_MIN))
+        ].sort_values("Best_Departure").head(1)
+
+        arr_min = pd.Timestamp(a["Best_Arrival"]).tz_convert("UTC").strftime("%Y%m%d_%H%M")
+        if cand.empty:
+            out.append({
+                "Interface_ID": f"NJT_Rail_Subway_{arr_min}",
+                "From_Node": "NJT_Rail",
+                "To_Node": "Subway",
+                "Link_Type": "Rail-Subway",
+                "Scheduled_Arrival": a.get("Scheduled_Arrival"),
+                "RT_Arrival": a.get("RT_Arrival"),
+                "Arrival_Delay_Min": a.get("Arrival_Delay_Min"),
+                "Scheduled_Departure": pd.NaT,
+                "RT_Departure": pd.NaT,
+                "Departure_Delay_Min": pd.NA,
+                "Transfer_Gap_Min": pd.NA,
+                "Missed_Transfer_Flag": True,
+                "Used_Scheduled_Fallback": bool(a["Used_Scheduled_Fallback"])
+            })
+            continue
+
+        d = cand.iloc[0]
+        gap = (pd.Timestamp(d["Best_Departure"]) - pd.Timestamp(a["Best_Arrival"])).total_seconds() / 60.0
+        out.append({
+            "Interface_ID": f"NJT_Rail_{d['To_Node']}_{arr_min}",
+            "From_Node": "NJT_Rail",
+            "To_Node": d["To_Node"],
+            "Link_Type": "Rail-Subway",
+            "Scheduled_Arrival": a.get("Scheduled_Arrival"),
+            "RT_Arrival": a.get("RT_Arrival"),
+            "Arrival_Delay_Min": a.get("Arrival_Delay_Min"),
+            "Scheduled_Departure": d.get("Scheduled_Departure"),
+            "RT_Departure": d.get("RT_Departure"),
+            "Departure_Delay_Min": d.get("Departure_Delay_Min"),
+            "Transfer_Gap_Min": gap,
+            "Missed_Transfer_Flag": (gap < MISSED_THRESHOLD_MIN),
+            "Used_Scheduled_Fallback": bool(a["Used_Scheduled_Fallback"])
+        })
+
+    return pd.DataFrame(out)
+
+
 
 # ---------------- TIME FEATURES & FIELDS ------------------
 def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
