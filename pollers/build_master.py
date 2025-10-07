@@ -274,52 +274,45 @@ def main() -> None:
     njt_ifaces = build_njt_interfaces()
 
     # Try to fill Scheduled_* for NJT from static GTFS if available
-try:
-    njt_sched = load_njt_schedule_for_date(SERVICE_DATE)
-    if not njt_sched.empty and not njt_ifaces.empty:
-        # Prefer real keys if you carried them through
-        if "trip_id" in njt_ifaces.columns and "stop_id" in njt_ifaces.columns:
-            left_keys = ["trip_id", "stop_id"]
-            njt_ifaces["trip_id"] = njt_ifaces["trip_id"].astype(str)
-            njt_ifaces["stop_id"] = njt_ifaces["stop_id"].astype(str)
+    try:
+        njt_sched = load_njt_schedule_for_date(SERVICE_DATE)
+        if not njt_sched.empty and not njt_ifaces.empty:
+            # Prefer real keys if present
+            if "trip_id" in njt_ifaces.columns and "stop_id" in njt_ifaces.columns:
+                left_keys = ["trip_id", "stop_id"]
+                njt_ifaces["trip_id"] = njt_ifaces["trip_id"].astype(str)
+                njt_ifaces["stop_id"] = njt_ifaces["stop_id"].astype(str)
+            else:
+                # Fallback: pull from Interface_ID ..._<trip_id>_<stop_id>
+                keys = njt_ifaces["Interface_ID"].str.extract(r'_(?P<trip_id>[^_]+)_(?P<stop_id>[^_]+)$')
+                njt_ifaces = pd.concat([njt_ifaces, keys], axis=1)
+                left_keys = ["trip_id", "stop_id"]
+
+            njt_sched["trip_id"] = njt_sched["trip_id"].astype(str)
+            njt_sched["stop_id"] = njt_sched["stop_id"].astype(str)
+
+            merged = njt_ifaces.merge(
+                njt_sched.rename(columns={
+                    "scheduled_arrival_utc": "SchedArrTmp",
+                    "scheduled_departure_utc": "SchedDepTmp",
+                }),
+                on=left_keys, how="left"
+            )
+
+            merged["Scheduled_Arrival"] = merged.get("Scheduled_Arrival", pd.NaT).fillna(merged["SchedArrTmp"])
+            merged["Scheduled_Departure"] = merged.get("Scheduled_Departure", pd.NaT).fillna(merged["SchedDepTmp"])
+            merged = merged.drop(columns=["SchedArrTmp","SchedDepTmp"], errors="ignore")
+            njt_ifaces = merged
+
+            print(f"[njt][sched] filled schedule for "
+                  f"{int(njt_ifaces['Scheduled_Arrival'].notna().sum())} arrivals / "
+                  f"{int(njt_ifaces['Scheduled_Departure'].notna().sum())} departures")
         else:
-            # Fallback: extract trip_id and stop_id from Interface_ID suffix ..._<trip_id>_<stop_id>
-            # Adjust regex if your Interface_ID format is different
-            keys = njt_ifaces["Interface_ID"].str.extract(r'_(?P<trip_id>[^_]+)_(?P<stop_id>\d+)$')
-            njt_ifaces = pd.concat([njt_ifaces, keys], axis=1)
-            left_keys = ["trip_id", "stop_id"]
+            print("[njt][sched] no schedule merge performed (empty njt_ifaces or no static)")
+    except Exception as e:
+        print(f"[njt][sched] could not join schedule: {e}")
 
-        njt_sched["trip_id"] = njt_sched["trip_id"].astype(str)
-        njt_sched["stop_id"] = njt_sched["stop_id"].astype(str)
-
-        merged = njt_ifaces.merge(
-            njt_sched.rename(columns={
-                "scheduled_arrival_utc": "SchedArrTmp",
-                "scheduled_departure_utc": "SchedDepTmp",
-            }),
-            on=left_keys, how="left"
-        )
-
-        # Fill only where empty
-        if "Scheduled_Arrival" in merged.columns:
-            merged["Scheduled_Arrival"] = merged["Scheduled_Arrival"].fillna(merged["SchedArrTmp"])
-        else:
-            merged["Scheduled_Arrival"] = merged["SchedArrTmp"]
-
-        if "Scheduled_Departure" in merged.columns:
-            merged["Scheduled_Departure"] = merged["Scheduled_Departure"].fillna(merged["SchedDepTmp"])
-        else:
-            merged["Scheduled_Departure"] = merged["SchedDepTmp"]
-
-        merged = merged.drop(columns=["SchedArrTmp","SchedDepTmp"], errors="ignore")
-        njt_ifaces = merged
-        print(f"[njt][sched] filled schedule for "
-              f"{int(njt_ifaces['Scheduled_Arrival'].notna().sum())} arrivals / "
-              f"{int(njt_ifaces['Scheduled_Departure'].notna().sum())} departures")
-    else:
-        print("[njt][sched] no schedule merge performed (empty njt_ifaces or no static)")
-except Exception as e:
-    print(f"[njt][sched] could not join schedule: {e}")
+    
 
       
     mta_ifaces = build_mta_interfaces_passthrough()
