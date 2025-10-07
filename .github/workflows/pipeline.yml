@@ -170,7 +170,6 @@ jobs:
           NJT_TOKEN_DIR: ~/.njt
           NJT_TOKEN_PATH: ~/.njt/token.json
           NJT_RT_DIR: ${{ env.NJT_RT_DIR }}
-          NJT_ENV: ${{ env.NJT_ENV }}
           # Optional: enforce Penn-only rows from the poller (already default)
           # NJT_FILTER_STOP_IDS: "105"
         run: |
