@@ -130,7 +130,7 @@ jobs:
       - name: Cache NJT token (per UTC day)
         uses: actions/cache@v4
         with:
-          path: ~/.njt/token.json
+          path: ~/.njt
           key: njt-token-${{ steps.date.outputs.today }}
 
       - name: Run NJT realtime poller
