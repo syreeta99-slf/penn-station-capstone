@@ -254,8 +254,11 @@ jobs:
           # Optional: PENN_STOP_IDS: ${{ env.PENN_STOP_IDS }}
         run: |
           echo "[t0] starting build_master"
+          echo "[debug] MASTER_OUT=$MASTER_OUT"
+          echo "[debug] MTA_RT_DIR=$MTA_RT_DIR ; NJT_RT_DIR=$NJT_RT_DIR"
           python pollers/build_master.py
           echo "[t1] build_master finished"
+          ls -lh data/curated || true
 
       - name: Upload curated outputs (artifact)
         uses: actions/upload-artifact@v4
