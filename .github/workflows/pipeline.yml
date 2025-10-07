@@ -208,6 +208,13 @@ jobs:
           key: gtfs-static-v1
           restore-keys: gtfs-static-
 
+      - name: Debug NJT static GTFS
+        run: |
+          echo "[debug] Checking gtfs_static directory"
+          ls -lh gtfs_static || true
+          echo "[debug] Looking for NJT zip files:"
+          ls -lh gtfs_static/*njt*.zip || echo "No NJT static zips found"
+
       - name: Prime static GTFS if missing
         timeout-minutes: 10
         run: |
