@@ -1,245 +1,227 @@
-#!/usr/bin/env python3
-"""
-NJT realtime rail poller (GTFS-RT, Production)
+name: MTA Subway – Rolling Master to Google Drive
 
-- Auth:    POST multipart to /api/GTFSRT/getToken (username,password)
-- Validate:POST multipart to /api/GTFSRT/isValidToken (token)
-- Fetch:   POST multipart to /api/GTFSRT/getTripUpdates (token) -> protobuf bytes
-- Parse:   google.transit.gtfs_realtime_pb2
-- Output:  Append normalized rows to CSV per UTC day
+on:
+  schedule:
+    - cron: "*/10 10-15 * * 1-5"
+    - cron: "*/10 20-23 * * 1-5"
+    - cron: "*/10 0-1 * * 1-5"
+    - cron: "0 12-23 * * 6,0"
+    - cron: "0 0-2 * * 0,1"
+  workflow_dispatch:
+    inputs:
+      missed_threshold_min:
+        description: "Minutes needed to make a transfer (missed if gap < this)"
+        required: false
+        type: choice
+        default: "2"
+        options: ["1","2","3","5"]
+      transfer_window_min:
+        description: "Max window to consider a transfer (minutes)"
+        required: false
+        type: choice
+        default: "20"
+        options: ["10","15","20","25","30"]
+      rt_max_files:
+        description: "How many most-recent RT CSVs to consider"
+        required: false
+        default: "120"
+        type: choice
+        options: ["60","90","120","180","240"]
+      service_date:
+        description: "Override service date (YYYY-MM-DD); leave blank to infer"
+        required: false
+        default: ""
+        type: string
 
-Env vars:
-  NJT_USERNAME   = (required) API username
-  NJT_PASSWORD   = (required) API password
-  NJT_RT_DIR     = (optional, default "data/njt_rt")
-  NJT_TOKEN_DIR  = (optional, default "~/.njt")
-  NJT_ENV        = (optional, default "prod")
+concurrency:
+  group: pipeline-${{ github.ref }}
+  cancel-in-progress: false
 
-Exit codes:
-  0 = success or benign skip (e.g. daily token limit reached)
-  1 = error (network, HTTP, parse, or missing creds)
-"""
+jobs:
+  subway_pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
 
-from __future__ import annotations
+    env:
+      # --- Google Drive sync target ---
+      GDRIVE_REMOTE_NAME: "googledrive"
+      GDRIVE_DIR: "penn-station/curated"
 
-import os
-import sys
-import json
-import enum
-import pathlib
-import logging
-import datetime as dt
-from typing import Optional, Tuple, List
+      # --- Realtime input folders (used by build_master.py) ---
+      MTA_RT_DIR: data/realtime
+      NJT_RT_DIR: data/njt_rt
 
-import requests
-import pandas as pd
-from google.transit import gtfs_realtime_pb2  # pip install gtfs-realtime-bindings
+      # --- Output master path ---
+      MASTER_OUT: data/curated/master_interface_dataset.csv
 
+      # --- Interface pairing controls (overridden by workflow_dispatch if provided) ---
+      TOL_MIN: "15"
+      TRANSFER_WINDOW_MIN: "20"
+      MISSED_THRESHOLD_MIN: "2"
 
-# -----------------------------
-# Config
-# -----------------------------
-USERNAME = os.getenv("NJT_USERNAME", "")
-PASSWORD = os.getenv("NJT_PASSWORD", "")
-TOKEN_DIR = pathlib.Path(os.getenv("NJT_TOKEN_DIR", str(pathlib.Path.home() / ".njt")))
-TOKEN_PATH = TOKEN_DIR / "token.json"
-OUT_DIR = pathlib.Path(os.getenv("NJT_RT_DIR", "data/njt_rt"))
+      # --- Optional filters/overrides ---
+      # PENN_STOP_IDS: "A28,A27,PSNY"
+      # SERVICE_DATE: "2025-10-06"
 
-# Hard-coded prod base (no NJT_BASE override needed anymore)
-BASE = "https://raildata.njtransit.com"
-EP_TOKEN = "/api/GTFSRT/getToken"
-EP_VALIDATE = "/api/GTFSRT/isValidToken"
-EP_TRIP_UPDATES = "/api/GTFSRT/getTripUpdates"
-TIMEOUT = 45
+      # --- NJT env (script defaults the base host internally) ---
+      NJT_ENV: "prod"
 
+    steps:
+      - uses: actions/checkout@v4
 
-# -----------------------------
-# Logging
-# -----------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [njt] %(message)s",
-    datefmt="[%Y-%m-%d %H:%M:%S+0000]",
-)
-log = logging.getLogger("njt")
+      - name: Ensure gtfs_static exists
+        run: mkdir -p gtfs_static
 
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
 
-# -----------------------------
-# Token status
-# -----------------------------
-class TokenStatus(enum.Enum):
-    OK = enum.auto()
-    DAILY_LIMIT = enum.auto()
-    UNAVAILABLE = enum.auto()
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
+      - name: Sanity check repo layout
+        run: |
+          echo "[repo] top-level:"; ls -lh
+          test -f pollers/mta_realtime_subway.py || { echo "::error::pollers/mta_realtime_subway.py missing"; exit 1; }
+          test -f pollers/build_master.py        || { echo "::error::pollers/build_master.py missing"; exit 1; }
+          test -f pollers/njt_realtime_rail.py   || { echo "::error::pollers/njt_realtime_rail.py missing"; exit 1; }
 
-# -----------------------------
-# Token helpers
-# -----------------------------
-def _save_token(token: str) -> None:
-    TOKEN_DIR.mkdir(parents=True, exist_ok=True)
-    TOKEN_PATH.write_text(
-        json.dumps({"token": token, "saved_utc": dt.datetime.utcnow().isoformat()}),
-        encoding="utf-8",
-    )
+      # ===== rclone install & configure =====
+      - name: Install rclone
+        run: |
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          rclone version
 
+      - name: Write rclone.conf from Base64 secret
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "${{ secrets.RCLONE_CONF_B64 }}" | base64 -d > ~/.config/rclone/rclone.conf
+          chmod 600 ~/.config/rclone/rclone.conf
+          rclone listremotes
+          rclone about "${{ env.GDRIVE_REMOTE_NAME }}:" || (echo "Drive remote not reachable"; exit 1)
 
-def _read_token() -> Optional[str]:
-    try:
-        if TOKEN_PATH.exists():
-            txt = TOKEN_PATH.read_text(encoding="utf-8").strip()
-            if txt:
-                return json.loads(txt).get("token")
-    except Exception:
-        pass
-    return None
+      # ===== PRE-SYNC: pull current master from Drive so we can append =====
+      - name: Pull prior master from Drive
+        run: |
+          mkdir -p data/curated
+          rclone lsd "${{ env.GDRIVE_REMOTE_NAME }}:${{ env.GDRIVE_DIR }}" || true
+          rclone copy "${{ env.GDRIVE_REMOTE_NAME }}:${{ env.GDRIVE_DIR }}" data/curated \
+            --include "master_interface_dataset.csv" \
+            --include "master_interface_dataset.parquet" \
+            --max-depth 1 --ignore-existing || true
+          ls -lh data/curated || true
 
+      # ===== Poll realtime (MTA Subway) =====
+      - name: Run MTA realtime poller
+        env:
+          MTA_API_KEY: ${{ secrets.MTA_API_KEY }}
+        run: python pollers/mta_realtime_subway.py
 
-def _request_new_token() -> Tuple[TokenStatus, Optional[str]]:
-    url = f"{BASE}{EP_TOKEN}"
-    files = {"username": (None, USERNAME), "password": (None, PASSWORD)}
-    try:
-        r = requests.post(url, files=files, timeout=TIMEOUT)
-        if r.status_code == 200:
-            try:
-                data = r.json()
-            except Exception:
-                data = {}
-            token = data.get("UserToken") or data.get("token") or ""
-            if token:
-                return TokenStatus.OK, token
-            if "daily token limit" in (r.text or "").lower():
-                return TokenStatus.DAILY_LIMIT, None
-            log.error(f"Token 200 without usable token; body={r.text[:200]!r}")
-            return TokenStatus.UNAVAILABLE, None
-        if r.status_code == 429:
-            return TokenStatus.DAILY_LIMIT, None
-        log.error(f"Token unexpected {r.status_code} {r.text[:200]!r}")
-        return TokenStatus.UNAVAILABLE, None
-    except requests.RequestException as e:
-        log.error(f"Token request failed: {e}")
-        return TokenStatus.UNAVAILABLE, None
+      # ===== Poll realtime (NJT Rail) – normalized CSVs =====
+      - name: Compute UTC date key
+        id: date
+        run: echo "today=$(date -u +%F)" >> $GITHUB_OUTPUT
 
+      - name: Cache NJT token (per UTC day)
+        uses: actions/cache@v4
+        with:
+          path: ~/.njt/token.json
+          key: njt-token-${{ steps.date.outputs.today }}
 
-def _validate_token(token: str) -> bool:
-    try:
-        r = requests.post(f"{BASE}{EP_VALIDATE}", files={"token": (None, token)}, timeout=TIMEOUT)
-        return r.status_code == 200 and "true" in (r.text or "").lower()
-    except requests.RequestException:
-        return False
+      - name: Run NJT realtime poller
+        env:
+          NJT_USERNAME: ${{ secrets.NJT_USERNAME }}
+          NJT_PASSWORD: ${{ secrets.NJT_PASSWORD }}
+          NJT_TOKEN_DIR: ~/.njt
+          NJT_RT_DIR: ${{ env.NJT_RT_DIR }}
+          NJT_ENV: ${{ env.NJT_ENV }}
+        run: |
+          mkdir -p "${{ env.NJT_RT_DIR }}"
+          python pollers/njt_realtime_rail.py || true   # non-fatal if daily token limit
 
+      - name: Show NJT poller logs & directory
+        run: |
+          echo "NJT_RT_DIR=${{ env.NJT_RT_DIR }}"
+          ls -lh "${{ env.NJT_RT_DIR }}" || true
+          # Show the 5 most recent files (if any)
+          find "${{ env.NJT_RT_DIR }}" -maxdepth 1 -type f -printf "%TY-%Tm-%Td %TT %p\n" | sort | tail -n 5 || true
 
-def get_token() -> Tuple[TokenStatus, Optional[str]]:
-    tok = _read_token()
-    if tok and _validate_token(tok):
-        return TokenStatus.OK, tok
-    if tok:
-        try:
-            TOKEN_PATH.unlink(missing_ok=True)
-        except Exception:
-            pass
-    status, token = _request_new_token()
-    if status is TokenStatus.OK and token:
-        _save_token(token)
-        return status, token
-    return status, None
+      - name: Upload realtime CSVs (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: realtime_csvs
+          path: |
+            data/realtime/*.csv
+            data/njt_rt/*.csv
+          retention-days: 3
 
+      # ===== Ensure static GTFS present =====
+      - name: Cache GTFS static
+        id: gtfs_cache
+        uses: actions/cache@v4
+        with:
+          path: gtfs_static
+          key: gtfs-static-v1
+          restore-keys: gtfs-static-
 
-# -----------------------------
-# GTFS-RT fetch/parse
-# -----------------------------
-def _to_iso_utc(epoch: Optional[int | float]) -> Optional[str]:
-    if epoch is None:
-        return None
-    ts = float(epoch)
-    if ts > 1e11:
-        ts /= 1000.0
-    return (
-        dt.datetime.utcfromtimestamp(ts)
-        .replace(tzinfo=dt.timezone.utc)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
+      - name: Prime static GTFS if missing
+        timeout-minutes: 10
+        run: |
+          if ls gtfs_static/subway_all_*.zip 1>/dev/null 2>&1; then
+            echo "Static GTFS present."
+          else
+            echo "Refreshing static GTFS…"
+            python pollers/mta_static_refresh.py
+          fi
 
+      - name: Show MTA+NJT input counts before build
+        run: |
+          echo "[debug] MTA_RT_DIR=${{ env.MTA_RT_DIR }}"
+          echo "[debug] NJT_RT_DIR=${{ env.NJT_RT_DIR }}"
+          echo "[debug] MTA files:"; ls -lh "${{ env.MTA_RT_DIR }}" || true
+          echo "[debug] NJT files:"; ls -lh "${{ env.NJT_RT_DIR }}" || true
 
-def _fetch_trip_updates(token: str) -> bytes:
-    r = requests.post(f"{BASE}{EP_TRIP_UPDATES}", files={"token": (None, token)}, timeout=TIMEOUT)
-    if r.status_code != 200:
-        raise RuntimeError(f"TripUpdates HTTP {r.status_code}: {r.text[:200]}")
-    return r.content
+      # ===== Build & APPEND to rolling master (reads MTA + NJT RT) =====
+      - name: Build master & append
+        env:
+          PYTHONUNBUFFERED: "1"
+          APPEND_TO_MASTER: "1"
+          ALLOW_STATIC_REFRESH: "0"
+          # Paths and tuning (flow to build_master.py)
+          MTA_RT_DIR: ${{ env.MTA_RT_DIR }}
+          NJT_RT_DIR: ${{ env.NJT_RT_DIR }}
+          MASTER_OUT: ${{ env.MASTER_OUT }}
+          TOL_MIN: ${{ env.TOL_MIN }}
+          TRANSFER_WINDOW_MIN: ${{ inputs.transfer_window_min || env.TRANSFER_WINDOW_MIN }}
+          MISSED_THRESHOLD_MIN: ${{ inputs.missed_threshold_min || env.MISSED_THRESHOLD_MIN }}
+          SERVICE_DATE: ${{ inputs.service_date || '' }}
+          # Optional: PENN_STOP_IDS: ${{ env.PENN_STOP_IDS }}
+        run: |
+          echo "[t0] starting build_master"
+          python pollers/build_master.py
+          echo "[t1] build_master finished"
 
+      - name: Upload curated outputs (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: curated_outputs
+          path: |
+            data/curated/master_interface_dataset.csv
+            data/curated/master_interface_dataset.parquet
+          retention-days: 7
 
-def _parse_trip_updates(pb_bytes: bytes) -> List[dict]:
-    feed = gtfs_realtime_pb2.FeedMessage()
-    feed.ParseFromString(pb_bytes)
-
-    source_minute = dt.datetime.utcnow().replace(second=0, microsecond=0, tzinfo=dt.timezone.utc)
-    source_iso = source_minute.isoformat().replace("+00:00", "Z")
-
-    rows: List[dict] = []
-    for ent in feed.entity:
-        if not ent.HasField("trip_update"):
-            continue
-        tu = ent.trip_update
-        trip_id = tu.trip.trip_id or ""
-        route_id = tu.trip.route_id or ""
-        for stu in tu.stop_time_update:
-            stop_id = getattr(stu, "stop_id", "")
-            arr_epoch = stu.arrival.time if stu.HasField("arrival") else None
-            dep_epoch = stu.departure.time if stu.HasField("departure") else None
-            arr_iso = _to_iso_utc(arr_epoch)
-            dep_iso = _to_iso_utc(dep_epoch)
-            if not (arr_iso or dep_iso):
-                continue
-            rows.append(
-                {
-                    "trip_id": trip_id,
-                    "stop_id": stop_id,
-                    "route_id": route_id,
-                    "rt_arrival_utc": arr_iso,
-                    "rt_departure_utc": dep_iso,
-                    "source_minute_utc": source_iso,
-                }
-            )
-    return rows
-
-
-def _append_daily_csv(rows: List[dict]) -> None:
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = OUT_DIR / f"njt_rt_{dt.date.today().strftime('%Y%m%d')}.csv"
-    if not rows:
-        log.info("No realtime rows parsed.")
-        return
-    df = pd.DataFrame.from_records(rows)
-    write_header = not out_path.exists()
-    df.to_csv(out_path, mode="a", index=False, header=write_header)
-    log.info(f"Wrote {len(df)} rows → {out_path}")
-
-
-# -----------------------------
-# Main
-# -----------------------------
-def main() -> None:
-    if not USERNAME or not PASSWORD:
-        log.error("Missing NJT_USERNAME or NJT_PASSWORD.")
-        sys.exit(1)
-
-    status, token = get_token()
-    if status is TokenStatus.OK and token:
-        try:
-            pb = _fetch_trip_updates(token)
-            rows = _parse_trip_updates(pb)
-            _append_daily_csv(rows)
-            sys.exit(0)
-        except Exception as e:
-            log.error(f"Poll error: {e}")
-            sys.exit(1)
-    if status is TokenStatus.DAILY_LIMIT:
-        log.info("Daily token limit reached; skipping until tomorrow.")
-        sys.exit(0)
-    log.error("Token unavailable; failing this run.")
-    sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
+      # ===== POST-SYNC: push updated master back to Drive =====
+      - name: Push updated master to Drive
+        run: |
+          rclone copy data/curated "${{ env.GDRIVE_REMOTE_NAME }}:${{ env.GDRIVE_DIR }}" \
+            --include "master_interface_dataset.csv" \
+            --include "master_interface_dataset.parquet" \
+            --create-empty-src-dirs \
+            --transfers 4 --checkers 8 \
+            --drive-chunk-size 64M \
+            --update --progress
