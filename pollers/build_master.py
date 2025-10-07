@@ -24,7 +24,8 @@ import glob
 import pathlib
 import datetime as dt
 from typing import List, Set
-
+import zipfile
+from zoneinfo import ZoneInfo
 import pandas as pd
 
 # ---------- config / env ----------
@@ -106,6 +107,46 @@ def _hour_of_day(ts) -> int | pd.NA:
         return int(t.tz_convert("UTC").hour)
     except Exception:
         return pd.NA
+
+def _latest_njt_static_zip() -> str | None:
+    # Adjust the glob to match your actual filename(s) in gtfs_static/
+    cands = sorted(glob.glob("gtfs_static/njt_rail_*.zip")) or sorted(glob.glob("gtfs_static/njt_*.zip"))
+    return cands[-1] if cands else None
+
+def load_njt_schedule_for_date(service_date: str) -> pd.DataFrame:
+    """
+    Return schedule rows with keys (trip_id, stop_id) and columns:
+    scheduled_arrival_utc, scheduled_departure_utc
+    """
+    zpath = _latest_njt_static_zip()
+    if not zpath:
+        print("[njt][sched] no NJT static zip found in gtfs_static/")
+        return pd.DataFrame(columns=["trip_id","stop_id","scheduled_arrival_utc","scheduled_departure_utc"])
+
+    with zipfile.ZipFile(zpath) as z:
+        def _read(name):
+            with z.open(name) as fh:
+                return pd.read_csv(fh)
+        # Required GTFS files
+        stop_times = _read("stop_times.txt")  # trip_id, stop_id, arrival_time, departure_time
+        # (You can also read trips/calendar if you want stricter service filtering)
+
+    # Build localized service date for >24h times
+    service_local = pd.to_datetime(service_date).tz_localize(ZoneInfo("America/New_York"))
+
+    def _time_to_dt(hms: str):
+        # Handles "27:15:00" etc. (times beyond 24h)
+        try:
+            h, m, s = map(int, hms.split(":"))
+        except Exception:
+            return pd.NaT
+        return (service_local + pd.to_timedelta(h, "h") + pd.to_timedelta(m, "m") + pd.to_timedelta(s, "s")).tz_convert("UTC")
+
+    st = stop_times[["trip_id","stop_id","arrival_time","departure_time"]].copy()
+    st["scheduled_arrival_utc"]   = st["arrival_time"].apply(_time_to_dt)
+    st["scheduled_departure_utc"] = st["departure_time"].apply(_time_to_dt)
+
+    return st[["trip_id","stop_id","scheduled_arrival_utc","scheduled_departure_utc"]]
 
 # ---------- IO ----------
 def read_glob_csv(folder: str, pattern: str) -> pd.DataFrame:
@@ -231,6 +272,56 @@ def main() -> None:
     print(f"[cfg] SUBWAY_PENN_NODE={SUBWAY_PENN_NODE}  NJT_FROM_NODE={NJT_FROM_NODE}")
 
     njt_ifaces = build_njt_interfaces()
+
+    # Try to fill Scheduled_* for NJT from static GTFS if available
+try:
+    njt_sched = load_njt_schedule_for_date(SERVICE_DATE)
+    if not njt_sched.empty and not njt_ifaces.empty:
+        # Prefer real keys if you carried them through
+        if "trip_id" in njt_ifaces.columns and "stop_id" in njt_ifaces.columns:
+            left_keys = ["trip_id", "stop_id"]
+            njt_ifaces["trip_id"] = njt_ifaces["trip_id"].astype(str)
+            njt_ifaces["stop_id"] = njt_ifaces["stop_id"].astype(str)
+        else:
+            # Fallback: extract trip_id and stop_id from Interface_ID suffix ..._<trip_id>_<stop_id>
+            # Adjust regex if your Interface_ID format is different
+            keys = njt_ifaces["Interface_ID"].str.extract(r'_(?P<trip_id>[^_]+)_(?P<stop_id>\d+)$')
+            njt_ifaces = pd.concat([njt_ifaces, keys], axis=1)
+            left_keys = ["trip_id", "stop_id"]
+
+        njt_sched["trip_id"] = njt_sched["trip_id"].astype(str)
+        njt_sched["stop_id"] = njt_sched["stop_id"].astype(str)
+
+        merged = njt_ifaces.merge(
+            njt_sched.rename(columns={
+                "scheduled_arrival_utc": "SchedArrTmp",
+                "scheduled_departure_utc": "SchedDepTmp",
+            }),
+            on=left_keys, how="left"
+        )
+
+        # Fill only where empty
+        if "Scheduled_Arrival" in merged.columns:
+            merged["Scheduled_Arrival"] = merged["Scheduled_Arrival"].fillna(merged["SchedArrTmp"])
+        else:
+            merged["Scheduled_Arrival"] = merged["SchedArrTmp"]
+
+        if "Scheduled_Departure" in merged.columns:
+            merged["Scheduled_Departure"] = merged["Scheduled_Departure"].fillna(merged["SchedDepTmp"])
+        else:
+            merged["Scheduled_Departure"] = merged["SchedDepTmp"]
+
+        merged = merged.drop(columns=["SchedArrTmp","SchedDepTmp"], errors="ignore")
+        njt_ifaces = merged
+        print(f"[njt][sched] filled schedule for "
+              f"{int(njt_ifaces['Scheduled_Arrival'].notna().sum())} arrivals / "
+              f"{int(njt_ifaces['Scheduled_Departure'].notna().sum())} departures")
+    else:
+        print("[njt][sched] no schedule merge performed (empty njt_ifaces or no static)")
+except Exception as e:
+    print(f"[njt][sched] could not join schedule: {e}")
+
+      
     mta_ifaces = build_mta_interfaces_passthrough()
 
     master_chunk = pd.concat([mta_ifaces, njt_ifaces], ignore_index=True)
