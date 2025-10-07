@@ -52,6 +52,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+      
+      - name: Ensure gtfs_static exists
+        run: mkdir -p gtfs_stat
 
       - uses: actions/setup-python@v4
         with:
