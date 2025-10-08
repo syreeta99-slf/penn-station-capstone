@@ -12,11 +12,7 @@ jobs:
       actions: read
       contents: read
     env:
-      # Artifact name prefixes (exact)
-      NJT_PREFIX: realtime_csvs
-      SUBWAY_PREFIX: subway_rt_
-
-      # Google Drive destination (rclone remote must exist in secret)
+      # Google Drive remote and paths (adjust if needed)
       GDRIVE_REMOTE_NAME: googledrive
       GDRIVE_BASE_DIR_NJT: penn-station/curated/njt
       GDRIVE_BASE_DIR_SUBWAY: penn-station/curated/subway
@@ -41,102 +37,143 @@ jobs:
           mkdir -p sweep/subway/all_csv
           mkdir -p dist
 
-      - name: Compute dates (NY timezone for filenames)
+      - name: Compute dates (NY timezone for folders)
         id: dates
         run: |
           echo "today=$(TZ=America/New_York date +%F)" >> $GITHUB_OUTPUT
-          echo "cutoff=$(date -d '7 days ago' -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
+          echo "cutoff=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
 
-      - name: List recent artifacts (last 7 days)
+      - name: List recent artifacts (last 7 days; any name)
         id: list
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Pull all pages
           gh api --paginate repos/${{ github.repository }}/actions/artifacts \
             -q '.artifacts[] | {id, name, expired, created_at}' > artifacts_all.json
 
-          echo "Filtering by cutoff: ${{ steps.dates.outputs.cutoff }}"
+          jq -c --arg cutoff "${{ steps.dates.outputs.cutoff }}" '
+            select(.expired == false) and (.created_at > $cutoff)
+          ' artifacts_all.json > artifacts_filtered.json
 
-          # NJT artifacts: realtime_csvs*
-          jq -c --arg cutoff "${{ steps.dates.outputs.cutoff }}" --arg pfx "$NJT_PREFIX" '
-            select(.expired==false)
-            | select(.name|startswith($pfx))
-            | select(.created_at > $cutoff)
-          ' artifacts_all.json > njt_artifacts.json
+          echo "Artifacts in last 7 days (not expired): $(wc -l < artifacts_filtered.json || echo 0)"
+          head -n 10 artifacts_filtered.json || true
 
-          # Subway artifacts: subway_rt_*  (note the trailing underscore)
-          jq -c --arg cutoff "${{ steps.dates.outputs.cutoff }}" --arg pfx "$SUBWAY_PREFIX" '
-            select(.expired==false)
-            | select(.name|startswith($pfx))
-            | select(.created_at > $cutoff)
-          ' artifacts_all.json > subway_artifacts.json
-
-          echo "Matched NJT artifacts:"
-          cat njt_artifacts.json || true
-          echo "Matched Subway artifacts:"
-          cat subway_artifacts.json || true
-
-      - name: Download & extract NJT artifacts
-        if: ${{ hashFiles('njt_artifacts.json') != '' }}
+      - name: Download, recursively extract, and route CSVs
+        if: ${{ hashFiles('artifacts_filtered.json') != '' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if [ -s njt_artifacts.json ]; then
+          set -euo pipefail
+
+          recursive_unzip() {
+            local root="$1"
+            local pass=0
+            local changed=1
+            while [ $changed -eq 1 ] && [ $pass -lt 6 ]; do
+              changed=0
+              while IFS= read -r innerzip; do
+                base=$(basename "$innerzip" .zip)
+                innerdir="$(dirname "$innerzip")/unz_${base}"
+                mkdir -p "$innerdir"
+                echo "Unpacking: $innerzip -> $innerdir"
+                unzip -o "$innerzip" -d "$innerdir" >/dev/null 2>&1 || true
+                rm -f "$innerzip" || true
+                changed=1
+              done < <(find "$root" -type f -name '*.zip' | sort)
+              pass=$((pass+1))
+            done
+          }
+
+          route_csv() {
+            local f="$1"
+            local b="$(basename "$f")"
+            local lc_b="$(echo "$b" | tr '[:upper:]' '[:lower:]')"
+
+            # Subway rule: filenames starting with subway_rt_
+            if [[ "$lc_b" == subway_rt_* ]]; then
+              echo " → Subway: $b"
+              cp -n "$f" sweep/subway/all_csv/ || true
+            else
+              # Default to NJT. If you have a precise NJT prefix (e.g., njt_rt_*), replace this else with that rule.
+              echo " → NJT: $b"
+              cp -n "$f" sweep/njt/all_csv/ || true
+            fi
+          }
+
+          if [ -s artifacts_filtered.json ]; then
             while read -r row; do
               id=$(echo "$row" | jq -r '.id')
               name=$(echo "$row" | jq -r '.name')
-              echo "NJT: downloading artifact $id ($name)"
-              gh api repos/${{ github.repository }}/actions/artifacts/$id/zip > art_${id}.zip || continue
-              unzip -o art_${id}.zip -d unpacked_$id >/dev/null 2>&1 || true
-              find "unpacked_$id" -type f -name '*.csv' -print -exec cp -n {} sweep/njt/all_csv/ \;
-            done < njt_artifacts.json
+              echo "::group::Artifact $id ($name)"
+
+              # Download outer artifact zip
+              gh api repos/${{ github.repository }}/actions/artifacts/$id/zip > art_${id}.zip || { echo "Download failed for $id"; echo "::endgroup::"; continue; }
+
+              # Unpack outer zip
+              outdir="unpacked_${id}"
+              mkdir -p "$outdir"
+              unzip -o art_${id}.zip -d "$outdir" >/dev/null 2>&1 || true
+
+              # Recursively unpack any inner zip(s) (e.g., realtime_csvs.zip -> realtime/)
+              recursive_unzip "$outdir"
+
+              # Debug visibility
+              echo "==== DIR TREE (maxdepth=2) ===="
+              find "$outdir" -maxdepth 2 -type d -print
+              echo "==== REMAINING ZIP FILES (should be none) ===="
+              find "$outdir" -type f -name '*.zip' -print || true
+              echo "==== CSV PREVIEW (first 50 basenames) ===="
+              find "$outdir" -type f -name '*.csv' -printf '%f\n' | sort | uniq | head -n 50
+
+              # Route CSVs
+              count=0
+              while IFS= read -r csv; do
+                route_csv "$csv"
+                count=$((count+1))
+              done < <(find "$outdir" -type f -name '*.csv' | sort)
+
+              echo "CSV files detected in this artifact: $count"
+              echo "::endgroup::"
+            done < artifacts_filtered.json
           else
-            echo "No NJT artifacts to download."
+            echo "No artifacts to process."
           fi
 
-      - name: Download & extract Subway artifacts
-        if: ${{ hashFiles('subway_artifacts.json') != '' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          if [ -s subway_artifacts.json ]; then
-            while read -r row; do
-              id=$(echo "$row" | jq -r '.id')
-              name=$(echo "$row" | jq -r '.name')
-              echo "Subway: downloading artifact $id ($name)"
-              gh api repos/${{ github.repository }}/actions/artifacts/$id/zip > art_${id}.zip || continue
-              unzip -o art_${id}.zip -d unpacked_$id >/dev/null 2>&1 || true
-              find "unpacked_$id" -type f -name '*.csv' -print -exec cp -n {} sweep/subway/all_csv/ \;
-            done < subway_artifacts.json
-          else
-            echo "No Subway artifacts to download."
-          fi
+          echo "Subway routed CSVs (preview):"
+          ls -l sweep/subway/all_csv | head || true
+          echo "NJT routed CSVs (preview):"
+          ls -l sweep/njt/all_csv | head || true
 
-      - name: Create NJT ZIP (last 7 days)
-        run: |
-          if [ -d sweep/njt/all_csv ] && [ "$(ls -1 sweep/njt/all_csv | wc -l)" -gt 0 ]; then
-            zip -r "dist/njt_realtime_${{ steps.dates.outputs.today }}.zip" sweep/njt/all_csv
-          else
-            echo "No NJT CSVs found; skipping NJT zip."
-          fi
+      # Publish two artifacts from this sweep run (handy for manual download)
+      - name: Upload artifact (Subway CSVs - consolidated)
+        if: ${{ hashFiles('sweep/subway/all_csv/*') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: subway_rt_consolidated_${{ steps.dates.outputs.today }}
+          path: sweep/subway/all_csv/*
+          retention-days: 7
 
-      - name: Create Subway ZIP (last 7 days)
-        run: |
-          if [ -d sweep/subway/all_csv ] && [ "$(ls -1 sweep/subway/all_csv | wc -l)" -gt 0 ]; then
-            zip -r "dist/subway_rt_${{ steps.dates.outputs.today }}.zip" sweep/subway/all_csv
-          else
-            echo "No Subway CSVs found; skipping Subway zip."
-          fi
+      - name: Upload artifact (NJT CSVs - consolidated)
+        if: ${{ hashFiles('sweep/njt/all_csv/*') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: njt_realtime_consolidated_${{ steps.dates.outputs.today }}
+          path: sweep/njt/all_csv/*
+          retention-days: 7
 
-      - name: Upload NJT ZIP to Google Drive
-        if: ${{ hashFiles('dist/njt_realtime_*.zip') != '' }}
+      # Upload plain folders to Google Drive (no extra zips)
+      - name: Upload Subway CSV folder to Drive
+        if: ${{ hashFiles('sweep/subway/all_csv/*') != '' }}
         run: |
-          rclone copy dist "${{ env.GDRIVE_REMOTE_NAME }}:${{ env.GDRIVE_BASE_DIR_NJT }}" --include "njt_realtime_*.zip" --fast-list
-          echo "Uploaded NJT zip(s) to $GDRIVE_BASE_DIR_NJT"
+          rclone copy sweep/subway/all_csv \
+            "${{ env.GDRIVE_REMOTE_NAME }}:${{ env.GDRIVE_BASE_DIR_SUBWAY }}/${{ steps.dates.outputs.today }}/" \
+            --fast-list --create-empty-src-dirs
+          echo "Uploaded Subway CSVs to $GDRIVE_BASE_DIR_SUBWAY/${{ steps.dates.outputs.today }}/"
 
-      - name: Upload Subway ZIP to Google Drive
-        if: ${{ hashFiles('dist/subway_rt_*.zip') != '' }}
+      - name: Upload NJT CSV folder to Drive
+        if: ${{ hashFiles('sweep/njt/all_csv/*') != '' }}
         run: |
-          rclone copy dist "${{ env.GDRIVE_REMOTE_NAME }}:${{ env.GDRIVE_BASE_DIR_SUBWAY }}" --include "subway_rt_*.zip" --fast-list
-          echo "Uploaded Subway zip(s) to $GDRIVE_BASE_DIR_SUBWAY"
+          rclone copy sweep/njt/all_csv \
+            "${{ env.GDRIVE_REMOTE_NAME }}:${{ env.GDRIVE_BASE_DIR_NJT }}/${{ steps.dates.outputs.today }}/" \
+            --fast-list --create-empty-src-dirs
+          echo "Uploaded NJT CSVs to $GDRIVE_BASE_DIR_NJT/${{ steps.dates.outputs.today }}/"
