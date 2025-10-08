@@ -12,7 +12,6 @@ jobs:
       actions: read
       contents: read
     env:
-      # Google Drive remote and paths (adjust if needed)
       GDRIVE_REMOTE_NAME: googledrive
       GDRIVE_BASE_DIR_NJT: penn-station/curated/njt
       GDRIVE_BASE_DIR_SUBWAY: penn-station/curated/subway
@@ -51,9 +50,14 @@ jobs:
           gh api --paginate repos/${{ github.repository }}/actions/artifacts \
             -q '.artifacts[] | {id, name, expired, created_at}' > artifacts_all.json
 
-          jq -c --arg cutoff "${{ steps.dates.outputs.cutoff }}" '
-            select(.expired == false) and (.created_at > $cutoff)
+          CUTOFF="${{ steps.dates.outputs.cutoff }}"
+          # ✅ Correct jq: both conditions inside a single select()
+          jq -c --arg cutoff "$CUTOFF" '
+            select((.expired == false) and (.created_at > $cutoff))
           ' artifacts_all.json > artifacts_filtered.json
+
+          # Remove blank lines just in case
+          sed -i '/^[[:space:]]*$/d' artifacts_filtered.json
 
           echo "Artifacts in last 7 days (not expired): $(wc -l < artifacts_filtered.json || echo 0)"
           head -n 10 artifacts_filtered.json || true
@@ -88,13 +92,11 @@ jobs:
             local f="$1"
             local b="$(basename "$f")"
             local lc_b="$(echo "$b" | tr '[:upper:]' '[:lower:]')"
-
-            # Subway rule: filenames starting with subway_rt_
             if [[ "$lc_b" == subway_rt_* ]]; then
               echo " → Subway: $b"
               cp -n "$f" sweep/subway/all_csv/ || true
             else
-              # Default to NJT. If you have a precise NJT prefix (e.g., njt_rt_*), replace this else with that rule.
+              # Tighten here if you have NJT prefix (e.g., njt_rt_*)
               echo " → NJT: $b"
               cp -n "$f" sweep/njt/all_csv/ || true
             fi
@@ -102,22 +104,22 @@ jobs:
 
           if [ -s artifacts_filtered.json ]; then
             while read -r row; do
+              # Skip non-object lines defensively
+              if ! echo "$row" | jq -e 'type == "object"' >/dev/null 2>&1; then
+                continue
+              fi
               id=$(echo "$row" | jq -r '.id')
               name=$(echo "$row" | jq -r '.name')
               echo "::group::Artifact $id ($name)"
 
-              # Download outer artifact zip
               gh api repos/${{ github.repository }}/actions/artifacts/$id/zip > art_${id}.zip || { echo "Download failed for $id"; echo "::endgroup::"; continue; }
 
-              # Unpack outer zip
               outdir="unpacked_${id}"
               mkdir -p "$outdir"
               unzip -o art_${id}.zip -d "$outdir" >/dev/null 2>&1 || true
 
-              # Recursively unpack any inner zip(s) (e.g., realtime_csvs.zip -> realtime/)
               recursive_unzip "$outdir"
 
-              # Debug visibility
               echo "==== DIR TREE (maxdepth=2) ===="
               find "$outdir" -maxdepth 2 -type d -print
               echo "==== REMAINING ZIP FILES (should be none) ===="
@@ -125,7 +127,6 @@ jobs:
               echo "==== CSV PREVIEW (first 50 basenames) ===="
               find "$outdir" -type f -name '*.csv' -printf '%f\n' | sort | uniq | head -n 50
 
-              # Route CSVs
               count=0
               while IFS= read -r csv; do
                 route_csv "$csv"
@@ -144,7 +145,6 @@ jobs:
           echo "NJT routed CSVs (preview):"
           ls -l sweep/njt/all_csv | head || true
 
-      # Publish two artifacts from this sweep run (handy for manual download)
       - name: Upload artifact (Subway CSVs - consolidated)
         if: ${{ hashFiles('sweep/subway/all_csv/*') != '' }}
         uses: actions/upload-artifact@v4
@@ -161,7 +161,6 @@ jobs:
           path: sweep/njt/all_csv/*
           retention-days: 7
 
-      # Upload plain folders to Google Drive (no extra zips)
       - name: Upload Subway CSV folder to Drive
         if: ${{ hashFiles('sweep/subway/all_csv/*') != '' }}
         run: |
