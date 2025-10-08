@@ -1,0 +1,81 @@
+name: Sweep past 7 days of realtime_csvs
+
+on:
+
+  workflow_dispatch: {}     
+  
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update && sudo apt-get install -y jq unzip
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+
+      - name: Write rclone.conf from secret
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "${{ secrets.RCLONE_CONF_B64 }}" | base64 -d > ~/.config/rclone/rclone.conf
+          chmod 600 ~/.config/rclone/rclone.conf
+
+      - name: Prepare workspace
+        run: mkdir -p sweep/all_csv
+
+      - name: List recent artifacts
+        id: list
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Get last 100 artifacts
+          gh api repos/${{ github.repository }}/actions/artifacts \
+            -q '.artifacts[] | {id, name, expired, created_at}' > artifacts.json
+
+          # Cutoff = 7 days ago
+          CUTOFF=$(date -d '7 days ago' -u +%Y-%m-%dT%H:%M:%SZ)
+
+          # Keep non-expired artifacts named realtime_csvs, created after cutoff
+          jq -c --arg cutoff "$CUTOFF" \
+             'select(.expired==false) 
+              | select(.name|startswith("realtime_csvs")) 
+              | select(.created_at > $cutoff)' \
+             artifacts.json > artifacts_filtered.json
+
+          echo "Found $(wc -l < artifacts_filtered.json) matching artifacts."
+
+      - name: Download & extract artifacts
+        if: ${{ hashFiles('artifacts_filtered.json') != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          while read -r row; do
+            id=$(echo "$row" | jq -r '.id')
+            name=$(echo "$row" | jq -r '.name')
+            echo "Downloading artifact $id ($name)"
+            gh api repos/${{ github.repository }}/actions/artifacts/$id/zip > art_${id}.zip || continue
+            unzip -o art_${id}.zip -d unpacked_$id >/dev/null 2>&1 || true
+            find unpacked_$id -type f -name '*.csv' -exec cp -n {} sweep/all_csv/ \;
+          done < artifacts_filtered.json
+
+      - name: Create consolidated zip
+        run: |
+          if [ -d sweep/all_csv ] && [ "$(ls -1 sweep/all_csv | wc -l)" -gt 0 ]; then
+            mkdir -p dist
+            zip -r dist/njt_realtime_$(date +%F).zip sweep/all_csv
+          else
+            echo "No CSVs found; skipping zip."
+          fi
+
+      - name: Upload consolidated zip to Google Drive
+        if: ${{ hashFiles('dist/*.zip') != '' }}
+        env:
+          GDRIVE_REMOTE_NAME: googledrive    # adjust if yours is named differently
+          GDRIVE_BASE_DIR: penn-station/consolidated
+        run: |
+          rclone copy dist "${GDRIVE_REMOTE_NAME}:${GDRIVE_BASE_DIR}" --fast-list
