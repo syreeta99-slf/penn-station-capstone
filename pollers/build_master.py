@@ -527,6 +527,10 @@ def build_mta_interfaces() -> pd.DataFrame:
     else:
         print("[mta][sched] no static schedule available; using only provided Scheduled_* fields")
 
+  
+    sched_arr = _to_dt_utc(sched_arr)
+    sched_dep = _to_dt_utc(sched_dep)
+    
     # Delays and time features
     arr_delay = (rt_arr - sched_arr) / pd.Timedelta(minutes=1)
     dep_delay = (rt_dep - sched_dep) / pd.Timedelta(minutes=1)
