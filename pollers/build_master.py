@@ -391,6 +391,11 @@ def build_njt_interfaces() -> pd.DataFrame:
         matched = join_njt_rt_to_schedule(rt_join, sched, tolerance_min=NJT_TOLERANCE_MIN)
         print(f"[njt][sched] matched {matched['Scheduled_Arrival'].notna().sum()} rows within ±{NJT_TOLERANCE_MIN} min")
 
+        matched = matched.rename(columns={
+            "rt_arrival_utc": "RT_Arrival",
+            "rt_departure_utc": "RT_Departure",
+        })
+
         # Merge matched schedule columns back onto interfaces
         out = out.merge(
             matched,
