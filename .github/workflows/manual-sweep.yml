@@ -1,7 +1,7 @@
 name: Sweep past 7 days of NJT & MTA realtime CSVs
 
 on:
-  workflow_dispatch: {}     # allow manual run
+  workflow_dispatch: {}
 
 jobs:
   sweep:
@@ -10,9 +10,9 @@ jobs:
       actions: read
       contents: read
     env:
-      # Adjust these if your artifact names differ
+      # Artifact name prefixes
       NJT_PREFIX: realtime_csvs
-      MTA_PREFIX: mta_realtime_csvs
+      MTA_PREFIX: subway_rt_
 
       # Google Drive destination (rclone remote must exist in secret)
       GDRIVE_REMOTE_NAME: googledrive
@@ -50,27 +50,30 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Pull all pages to be safe
+          # Pull all pages
           gh api --paginate repos/${{ github.repository }}/actions/artifacts \
             -q '.artifacts[] | {id, name, expired, created_at}' > artifacts_all.json
 
           echo "Filtering by cutoff: ${{ steps.dates.outputs.cutoff }}"
 
-          # Separate NJT vs MTA by artifact name prefix
+          # NJT
           jq -c --arg cutoff "${{ steps.dates.outputs.cutoff }}" --arg pfx "$NJT_PREFIX" '
             select(.expired==false)
             | select(.name|startswith($pfx))
             | select(.created_at > $cutoff)
           ' artifacts_all.json > njt_artifacts.json
 
+          # MTA (subway_rt_*)
           jq -c --arg cutoff "${{ steps.dates.outputs.cutoff }}" --arg pfx "$MTA_PREFIX" '
             select(.expired==false)
             | select(.name|startswith($pfx))
             | select(.created_at > $cutoff)
           ' artifacts_all.json > mta_artifacts.json
 
-          echo "NJT artifacts: $(wc -l < njt_artifacts.json || echo 0)"
-          echo "MTA artifacts: $(wc -l < mta_artifacts.json || echo 0)"
+          echo "Matched NJT artifacts:"
+          cat njt_artifacts.json || true
+          echo "Matched MTA artifacts:"
+          cat mta_artifacts.json || true
 
       - name: Download & extract NJT artifacts
         if: ${{ hashFiles('njt_artifacts.json') != '' }}
@@ -84,7 +87,6 @@ jobs:
               echo "NJT: downloading artifact $id ($name)"
               gh api repos/${{ github.repository }}/actions/artifacts/$id/zip > art_${id}.zip || continue
               unzip -o art_${id}.zip -d unpacked_$id >/dev/null 2>&1 || true
-              # copy all CSVs, keep first occurrence of any duplicate filename
               find "unpacked_$id" -type f -name '*.csv' -print -exec cp -n {} sweep/njt/all_csv/ \;
             done < njt_artifacts.json
           else
