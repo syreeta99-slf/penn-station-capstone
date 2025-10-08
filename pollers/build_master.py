@@ -260,8 +260,10 @@ def join_njt_rt_to_schedule(rt: pd.DataFrame, sched: pd.DataFrame, tolerance_min
         )
         # Fill back into mergedA
         idx = unmatched.index
-        mergedA.loc[idx, "trip_id"] = mergedD["trip_id"].values
-        mergedA.loc[idx, "sched_key_sec"] = mergedD["sched_key_sec"].values
+        if "trip_id" in mergedD.columns:
+            mergedA.loc[idx, "trip_id"] = mergedD["trip_id"].values
+        if "sched_key_sec" in mergedD.columns:
+            mergedA.loc[idx, "sched_key_sec"] = mergedD["sched_key_sec"].values
 
     # Reconstruct scheduled UTC timestamps from (local_date, seconds)
     mergedA["Scheduled_Arrival"] = _sec_to_local_utc(mergedA["local_date_arr"], mergedA["sched_key_sec"])
