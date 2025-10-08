@@ -1,15 +1,23 @@
-name: Sweep past 7 days of realtime_csvs
+name: Sweep past 7 days of NJT & MTA realtime CSVs
 
 on:
+  workflow_dispatch: {}     # allow manual run
 
-  workflow_dispatch: {}     
-  
 jobs:
   sweep:
     runs-on: ubuntu-latest
     permissions:
       actions: read
       contents: read
+    env:
+      # Adjust these if your artifact names differ
+      NJT_PREFIX: realtime_csvs
+      MTA_PREFIX: mta_realtime_csvs
+
+      # Google Drive destination (rclone remote must exist in secret)
+      GDRIVE_REMOTE_NAME: googledrive
+      GDRIVE_BASE_DIR_NJT: penn-station/curated/njt
+      GDRIVE_BASE_DIR_MTA: penn-station/curated/mta
 
     steps:
       - uses: actions/checkout@v4
@@ -19,63 +27,112 @@ jobs:
           sudo apt-get update && sudo apt-get install -y jq unzip
           curl -fsSL https://rclone.org/install.sh | sudo bash
 
-      - name: Write rclone.conf from secret
+      - name: Configure rclone from secret
         run: |
           mkdir -p ~/.config/rclone
           echo "${{ secrets.RCLONE_CONF_B64 }}" | base64 -d > ~/.config/rclone/rclone.conf
           chmod 600 ~/.config/rclone/rclone.conf
 
       - name: Prepare workspace
-        run: mkdir -p sweep/all_csv
+        run: |
+          mkdir -p sweep/njt/all_csv
+          mkdir -p sweep/mta/all_csv
+          mkdir -p dist
 
-      - name: List recent artifacts
+      - name: Compute dates (NY timezone for filenames)
+        id: dates
+        run: |
+          echo "today=$(TZ=America/New_York date +%F)" >> $GITHUB_OUTPUT
+          echo "cutoff=$(date -d '7 days ago' -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
+
+      - name: List recent artifacts (last 7 days)
         id: list
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Get last 100 artifacts
-          gh api repos/${{ github.repository }}/actions/artifacts \
-            -q '.artifacts[] | {id, name, expired, created_at}' > artifacts.json
+          # Pull all pages to be safe
+          gh api --paginate repos/${{ github.repository }}/actions/artifacts \
+            -q '.artifacts[] | {id, name, expired, created_at}' > artifacts_all.json
 
-          # Cutoff = 7 days ago
-          CUTOFF=$(date -d '7 days ago' -u +%Y-%m-%dT%H:%M:%SZ)
+          echo "Filtering by cutoff: ${{ steps.dates.outputs.cutoff }}"
 
-          # Keep non-expired artifacts named realtime_csvs, created after cutoff
-          jq -c --arg cutoff "$CUTOFF" \
-             'select(.expired==false) 
-              | select(.name|startswith("realtime_csvs")) 
-              | select(.created_at > $cutoff)' \
-             artifacts.json > artifacts_filtered.json
+          # Separate NJT vs MTA by artifact name prefix
+          jq -c --arg cutoff "${{ steps.dates.outputs.cutoff }}" --arg pfx "$NJT_PREFIX" '
+            select(.expired==false)
+            | select(.name|startswith($pfx))
+            | select(.created_at > $cutoff)
+          ' artifacts_all.json > njt_artifacts.json
 
-          echo "Found $(wc -l < artifacts_filtered.json) matching artifacts."
+          jq -c --arg cutoff "${{ steps.dates.outputs.cutoff }}" --arg pfx "$MTA_PREFIX" '
+            select(.expired==false)
+            | select(.name|startswith($pfx))
+            | select(.created_at > $cutoff)
+          ' artifacts_all.json > mta_artifacts.json
 
-      - name: Download & extract artifacts
-        if: ${{ hashFiles('artifacts_filtered.json') != '' }}
+          echo "NJT artifacts: $(wc -l < njt_artifacts.json || echo 0)"
+          echo "MTA artifacts: $(wc -l < mta_artifacts.json || echo 0)"
+
+      - name: Download & extract NJT artifacts
+        if: ${{ hashFiles('njt_artifacts.json') != '' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          while read -r row; do
-            id=$(echo "$row" | jq -r '.id')
-            name=$(echo "$row" | jq -r '.name')
-            echo "Downloading artifact $id ($name)"
-            gh api repos/${{ github.repository }}/actions/artifacts/$id/zip > art_${id}.zip || continue
-            unzip -o art_${id}.zip -d unpacked_$id >/dev/null 2>&1 || true
-            find unpacked_$id -type f -name '*.csv' -exec cp -n {} sweep/all_csv/ \;
-          done < artifacts_filtered.json
-
-      - name: Create consolidated zip
-        run: |
-          if [ -d sweep/all_csv ] && [ "$(ls -1 sweep/all_csv | wc -l)" -gt 0 ]; then
-            mkdir -p dist
-            zip -r dist/njt_realtime_$(date +%F).zip sweep/all_csv
+          if [ -s njt_artifacts.json ]; then
+            while read -r row; do
+              id=$(echo "$row" | jq -r '.id')
+              name=$(echo "$row" | jq -r '.name')
+              echo "NJT: downloading artifact $id ($name)"
+              gh api repos/${{ github.repository }}/actions/artifacts/$id/zip > art_${id}.zip || continue
+              unzip -o art_${id}.zip -d unpacked_$id >/dev/null 2>&1 || true
+              # copy all CSVs, keep first occurrence of any duplicate filename
+              find "unpacked_$id" -type f -name '*.csv' -print -exec cp -n {} sweep/njt/all_csv/ \;
+            done < njt_artifacts.json
           else
-            echo "No CSVs found; skipping zip."
+            echo "No NJT artifacts to download."
           fi
 
-      - name: Upload consolidated zip to Google Drive
-        if: ${{ hashFiles('dist/*.zip') != '' }}
+      - name: Download & extract MTA artifacts
+        if: ${{ hashFiles('mta_artifacts.json') != '' }}
         env:
-          GDRIVE_REMOTE_NAME: googledrive    # adjust if yours is named differently
-          GDRIVE_BASE_DIR: penn-station/consolidated
+          GH_TOKEN: ${{ github.token }}
         run: |
-          rclone copy dist "${GDRIVE_REMOTE_NAME}:${GDRIVE_BASE_DIR}" --fast-list
+          if [ -s mta_artifacts.json ]; then
+            while read -r row; do
+              id=$(echo "$row" | jq -r '.id')
+              name=$(echo "$row" | jq -r '.name')
+              echo "MTA: downloading artifact $id ($name)"
+              gh api repos/${{ github.repository }}/actions/artifacts/$id/zip > art_${id}.zip || continue
+              unzip -o art_${id}.zip -d unpacked_$id >/dev/null 2>&1 || true
+              find "unpacked_$id" -type f -name '*.csv' -print -exec cp -n {} sweep/mta/all_csv/ \;
+            done < mta_artifacts.json
+          else
+            echo "No MTA artifacts to download."
+          fi
+
+      - name: Create NJT ZIP (last 7 days)
+        run: |
+          if [ -d sweep/njt/all_csv ] && [ "$(ls -1 sweep/njt/all_csv | wc -l)" -gt 0 ]; then
+            zip -r "dist/njt_realtime_${{ steps.dates.outputs.today }}.zip" sweep/njt/all_csv
+          else
+            echo "No NJT CSVs found; skipping NJT zip."
+          fi
+
+      - name: Create MTA ZIP (last 7 days)
+        run: |
+          if [ -d sweep/mta/all_csv ] && [ "$(ls -1 sweep/mta/all_csv | wc -l)" -gt 0 ]; then
+            zip -r "dist/mta_realtime_${{ steps.dates.outputs.today }}.zip" sweep/mta/all_csv
+          else
+            echo "No MTA CSVs found; skipping MTA zip."
+          fi
+
+      - name: Upload NJT ZIP to Google Drive
+        if: ${{ hashFiles('dist/njt_realtime_*.zip') != '' }}
+        run: |
+          rclone copy dist "=${{ env.GDRIVE_REMOTE_NAME }}:${{ env.GDRIVE_BASE_DIR_NJT }}" --include "njt_realtime_*.zip" --fast-list
+          echo "Uploaded NJT zip(s) to $GDRIVE_BASE_DIR_NJT"
+
+      - name: Upload MTA ZIP to Google Drive
+        if: ${{ hashFiles('dist/mta_realtime_*.zip') != '' }}
+        run: |
+          rclone copy dist "=${{ env.GDRIVE_REMOTE_NAME }}:${{ env.GDRIVE_BASE_DIR_MTA }}" --include "mta_realtime_*.zip" --fast-list
+          echo "Uploaded MTA zip(s) to $GDRIVE_BASE_DIR_MTA"
