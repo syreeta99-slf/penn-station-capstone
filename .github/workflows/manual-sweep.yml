@@ -128,11 +128,11 @@ jobs:
       - name: Upload NJT ZIP to Google Drive
         if: ${{ hashFiles('dist/njt_realtime_*.zip') != '' }}
         run: |
-          rclone copy dist "=${{ env.GDRIVE_REMOTE_NAME }}:${{ env.GDRIVE_BASE_DIR_NJT }}" --include "njt_realtime_*.zip" --fast-list
+          rclone copy dist "${{ env.GDRIVE_REMOTE_NAME }}:${{ env.GDRIVE_BASE_DIR_NJT }}" --include "njt_realtime_*.zip" --fast-list
           echo "Uploaded NJT zip(s) to $GDRIVE_BASE_DIR_NJT"
 
       - name: Upload MTA ZIP to Google Drive
         if: ${{ hashFiles('dist/mta_realtime_*.zip') != '' }}
         run: |
-          rclone copy dist "=${{ env.GDRIVE_REMOTE_NAME }}:${{ env.GDRIVE_BASE_DIR_MTA }}" --include "mta_realtime_*.zip" --fast-list
+          rclone copy dist "${{ env.GDRIVE_REMOTE_NAME }}:${{ env.GDRIVE_BASE_DIR_MTA }}" --include "mta_realtime_*.zip" --fast-list
           echo "Uploaded MTA zip(s) to $GDRIVE_BASE_DIR_MTA"
