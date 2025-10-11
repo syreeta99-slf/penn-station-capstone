@@ -2,7 +2,6 @@ name: Poll MTA Subway (Penn) → Drive
 
 on:
   schedule:
-    # Staggered 10/day (5 minutes after NJT) to avoid overlap
     - cron: "5 10 * * *"
     - cron: "5 12 * * *"
     - cron: "5 14 * * *"
@@ -39,7 +38,7 @@ jobs:
           mkdir -p ~/.config/rclone
           echo "$RCLONE_CONF_B64" | base64 -d > ~/.config/rclone/rclone.conf
           chmod 600 ~/.config/rclone/rclone.conf
-      - name: Ensure local/remote dirs
+      - name: Ensure dirs
         env:
           GDRIVE_REMOTE_NAME: ${{ secrets.GDRIVE_REMOTE_NAME }}
           GDRIVE_DIR_SUBWAY: ${{ vars.GDRIVE_DIR_SUBWAY || 'penn-station/subway' }}
@@ -48,8 +47,9 @@ jobs:
           rclone mkdir "${GDRIVE_REMOTE_NAME}:${GDRIVE_DIR_SUBWAY}/raw" || true
       - name: Poll & append
         env:
+          SUBWAY_STOP_IDS: ${{ secrets.SUBWAY_STOP_IDS }}  # e.g., "127N,127S,A34N,A34S"
+          # Optional; added only if you have one
           MTA_API_KEY: ${{ secrets.MTA_API_KEY }}
-          SUBWAY_STOP_IDS: ${{ secrets.SUBWAY_STOP_IDS }}   # e.g., "127N,127S,A34N,A34S"
           SUBWAY_FEEDS_JSON: '["https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs","https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-ace"]'
           GDRIVE_REMOTE_NAME: ${{ secrets.GDRIVE_REMOTE_NAME }}
           GDRIVE_DIR_SUBWAY: ${{ vars.GDRIVE_DIR_SUBWAY || 'penn-station/subway' }}
