@@ -55,4 +55,4 @@ jobs:
           GDRIVE_REMOTE_NAME: ${{ secrets.GDRIVE_REMOTE_NAME }}
           GDRIVE_DIR_SUBWAY: ${{ vars.GDRIVE_DIR_SUBWAY || 'penn-station/subway' }}
           SUBWAY_MASTER_NAME: ${{ vars.SUBWAY_MASTER_NAME || 'subway_penn_master.csv' }}
-        run: python3 scripts/poll_subway.py
+        run: python3 pollers/poll_subway.py
