@@ -21,7 +21,6 @@ jobs:
 
       - name: Create token dir
         run: mkdir -p ~/.njt
-
       - name: Get NJT token (username/password -> UserToken)
         shell: bash
         env:
@@ -30,36 +29,47 @@ jobs:
           NJT_TOKEN_URL: ${{ vars.NJT_TOKEN_URL || 'https://raildata.njtransit.com/api/GTFSRT/getToken' }}
         run: |
           cat > get_token.py <<'PY'
-import os, json, pathlib, requests, sys
-u = os.getenv("NJT_USERNAME"); p = os.getenv("NJT_PASSWORD"); url = os.getenv("NJT_TOKEN_URL")
-if not (u and p and url):
-    print("[fatal] Missing NJT_USERNAME/NJT_PASSWORD or NJT_TOKEN_URL", file=sys.stderr); sys.exit(2)
+          import os
+          import json 
+          import pathlib, 
+          import request
+          import sys
 
-# NJT expects multipart/form-data with fields: username, password
-files = {
-    "username": (None, u),
-    "password": (None, p),
-}
-r = requests.post(url, files=files, timeout=30)
-print("[debug] status", r.status_code)
-if r.status_code >= 400:
-    print(r.text[:400])
-    r.raise_for_status()
+          u = os.getenv("NJT_USERNAME")
+          p = os.getenv("NJT_PASSWORD")
+          url = os.getenv("NJT_TOKEN_URL")
 
-# Example JSON: {"Authenticated":"True","UserToken":"<token>"}
-js = r.json()
-token = js.get("UserToken") or js.get("token")
-if not token:
-    print("[fatal] No UserToken in response", js, file=sys.stderr); sys.exit(3)
+          if not (u and p and url):
+              print("[fatal] Missing NJT_USERNAME/NJT_PASSWORD or NJT_TOKEN_URL", file=sys.stderr)
+              sys.exit(2)
 
-out = {"UserToken": token}
-path = pathlib.Path.home()/".njt"/"token.json"
-path.parent.mkdir(parents=True, exist_ok=True)
-path.write_text(json.dumps(out))
-print("[ok] token saved to", path)
-PY
+          # NJT expects multipart/form-data with fields: username, password
+          files = {
+              "username": (None, u),
+              "password": (None, p),
+          }    
+          r = requests.post(url, files=files, timeout=30)
+          print("[debug] status", r.status_code)
+          if r.status_code >= 400:
+              print(r.text[:400])
+              r.raise_for_status()
+
+          js = r.json()
+          token = js.get("UserToken") or js.get("token")
+          if not token:
+              print("[fatal] No UserToken in response", js, file=sys.stderr)
+              sys.exit(3)
+
+          out = {"UserToken": token}
+          path = pathlib.Path.home()/".njt"/"token.json"
+          path.parent.mkdir(parents=True, exist_ok=True)
+          path.write_text(json.dumps(out))
+          print("[ok] token saved to", path)
+          PY
+
           python get_token.py
 
+     
       - name: Save token (cache, keyed by New York date)
         uses: actions/cache/save@v4
         with:
