@@ -71,7 +71,16 @@ jobs:
 
      
       - name: Save token (cache, keyed by New York date)
-        uses: actions/cache/save@v4
+        id: save_token
+        run: |
+          key="njt-token-$(TZ=America/New_York date +%Y-%m-%d)"
+          echo "Cache key: $key"
+          echo "key=$key" >> $GITHUB_OUTPUT
+          echo "[debug] token.json exists:"
+          ls -l ~/.njt/token.json
+        shell: bash
+
+      - uses: actions/cache/save@v4
         with:
           path: ~/.njt/token.json
-          key: njt-token-$(TZ=America/New_York date +%Y-%m-%d)
+          key: ${{ steps.save_token.outputs.key }}
