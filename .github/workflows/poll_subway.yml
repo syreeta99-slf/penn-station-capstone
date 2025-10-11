@@ -2,16 +2,7 @@ name: Poll MTA Subway (Penn) → Drive
 
 on:
   schedule:
-    - cron: "5 10 * * *"
-    - cron: "5 12 * * *"
-    - cron: "5 14 * * *"
-    - cron: "5 16 * * *"
-    - cron: "5 18 * * *"
-    - cron: "5 20 * * *"
-    - cron: "5 22 * * *"
-    - cron: "5 0 * * *"
-    - cron: "5 2 * * *"
-    - cron: "5 4 * * *"
+    - cron: "5,35 * * * *"
   workflow_dispatch: {}
 
 concurrency:
