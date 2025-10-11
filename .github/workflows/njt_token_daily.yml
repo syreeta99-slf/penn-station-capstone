@@ -1,0 +1,46 @@
+name: NJT Token (daily)
+
+on:
+  schedule:
+    # 00:05 America/New_York ≈ 04:05 UTC (adjusts when DST changes)
+    - cron: "5 4 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  token:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Create token dir
+        run: mkdir -p ~/.njt
+
+      - name: Get NJT token
+        env:
+          NJT_CLIENT_ID: ${{ secrets.NJT_CLIENT_ID }}
+          NJT_CLIENT_SECRET: ${{ secrets.NJT_CLIENT_SECRET }}
+        run: |
+          python - <<'PY'
+          import os, json, pathlib, requests
+
+          cid = os.getenv("NJT_CLIENT_ID")
+          cs = os.getenv("NJT_CLIENT_SECRET")
+
+          url = "https://raildata.njtransit.com/RailDataWS/Authentication/getToken"
+          r = requests.post(url, json={"client_id": cid, "client_secret": cs}, timeout=30)
+          r.raise_for_status()
+
+          tok = r.json()
+          p = pathlib.Path.home() / ".njt" / "token.json"
+          p.parent.mkdir(parents=True, exist_ok=True)
+          p.write_text(json.dumps(tok))
+          print("[ok] token saved to", p)
+          PY
+
+      - name: Save token (date-keyed, New York timezone)
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.njt/token.json
+          key: njt-token-$(TZ=America/New_York date +%Y-%m-%d)
