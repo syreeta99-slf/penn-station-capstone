@@ -3,12 +3,9 @@ import os, sys, csv, json, time, tempfile, pathlib, subprocess, datetime, reques
 from typing import List
 from google.transit import gtfs_realtime_pb2  # pip install gtfs-realtime-bindings protobuf
 
-# -----------------------------
-# Config via env
-# -----------------------------
+# Config (env)
 STOP_ID = os.getenv("NJT_STOP_ID", "105")  # Penn Station (NJT)
-TRIP_UPDATES_URL = os.getenv("NJT_TRIP_UPDATES_URL", "https://raildata.njtransit.com/gtfsrt/tripUpdates")
-TOKEN_STYLE = os.getenv("NJT_TOKEN_STYLE", "header").lower()  # "header" or "param"
+TRIP_UPDATES_URL = os.getenv("NJT_GET_TRIP_UPDATES_URL", "https://raildata.njtransit.com/api/GTFSRT/getTripUpdates")
 GDRIVE_REMOTE = os.getenv("GDRIVE_REMOTE_NAME")
 GDRIVE_DIR = os.getenv("GDRIVE_DIR_NJT", "penn-station/njt")
 MASTER_NAME = os.getenv("NJT_MASTER_NAME", "njt_penn_master.csv")
@@ -19,9 +16,6 @@ FIELDS = [
     "arrival_time","departure_time","delay_sec","schedule_relationship","entity_id"
 ]
 
-# -----------------------------
-# Helpers
-# -----------------------------
 def ts() -> str:
     return datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 
@@ -30,33 +24,25 @@ def out_name() -> str:
 
 def load_token() -> str:
     if not TOKEN_PATH.exists():
-        print("[fatal] missing token.json; run daily token workflow first", file=sys.stderr)
+        print("[fatal] missing ~/.njt/token.json; run daily token workflow first", file=sys.stderr)
         sys.exit(2)
     try:
-        tok = json.loads(TOKEN_PATH.read_text())
+        js = json.loads(TOKEN_PATH.read_text())
+        tok = js.get("UserToken") or js.get("token") or js.get("access_token")
+        if not tok:
+            raise ValueError("No token field found")
+        return tok
     except Exception as e:
-        print(f"[fatal] could not read token.json: {e}", file=sys.stderr)
+        print(f"[fatal] could not read token: {e}", file=sys.stderr)
         sys.exit(2)
 
-    # Try common field names; adjust if Swagger shows a different key
-    for k in ("access_token", "token", "Token", "AccessToken"):
-        if k in tok and tok[k]:
-            return tok[k]
-    # If token is plain string file
-    if isinstance(tok, str) and tok.strip():
-        return tok.strip()
-    print("[fatal] token.json did not contain a recognizable token field", file=sys.stderr)
-    sys.exit(2)
-
-def fetch_trip_updates(raw_token: str) -> bytes:
-    if TOKEN_STYLE == "param":
-        r = requests.get(TRIP_UPDATES_URL, params={"token": raw_token}, timeout=30)
-    else:
-        r = requests.get(TRIP_UPDATES_URL, headers={"Authorization": f"Bearer {raw_token}"}, timeout=30)
-
+def fetch_trip_updates(user_token: str) -> bytes:
+    # NJT expects multipart/form-data with 'token' field for GTFS-RT endpoints
+    files = {"token": (None, user_token)}
+    r = requests.post(TRIP_UPDATES_URL, files=files, timeout=30)
     if r.status_code == 401:
-        print("[warn] 401 Unauthorized with cached token; not reissuing token in poll job", file=sys.stderr)
-        sys.exit(78)  # Distinct code for visibility
+        print("[warn] 401 Unauthorized with cached token; not reissuing in poll job", file=sys.stderr)
+        sys.exit(78)
     r.raise_for_status()
     return r.content  # protobuf bytes
 
@@ -122,9 +108,6 @@ def append_to_master(local_new_csv: str) -> None:
             subprocess.check_call(["cp", local_new_csv, local_master])
         subprocess.check_call(["rclone","copyto", local_master, remote_master])
 
-# -----------------------------
-# Main
-# -----------------------------
 def main():
     if not GDRIVE_REMOTE:
         print("Missing GDRIVE_REMOTE_NAME env.", file=sys.stderr)
@@ -137,10 +120,9 @@ def main():
     outpath = os.path.join("data","njt", out_name())
     write_csv(outpath, rows)
 
-    # upload raw poll for auditing
+    # raw audit copy
     subprocess.run(["rclone","copyto", outpath, f"{GDRIVE_REMOTE}:{GDRIVE_DIR}/raw/{os.path.basename(outpath)}"], check=False)
 
-    # append to master
     append_to_master(outpath)
     print(f"[ok] NJT poll (stop {STOP_ID}) appended to {GDRIVE_DIR}/{MASTER_NAME} with {len(rows)} rows")
 
