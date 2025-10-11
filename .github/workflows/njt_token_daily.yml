@@ -32,7 +32,7 @@ jobs:
           import os
           import json 
           import pathlib 
-          import request
+          import requests
           import sys
 
           u = os.getenv("NJT_USERNAME")
