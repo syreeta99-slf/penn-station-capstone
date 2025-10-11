@@ -2,6 +2,8 @@ name: Poll NJT (Penn 105) → Drive
 
 on:
   schedule:
+    # Keep your existing 10/day or adjust as desired.
+    # Example: peak-heavy set you used previously:
     - cron: "30 10 * * *"
     - cron: "0 11 * * *"
     - cron: "30 11 * * *"
@@ -21,40 +23,59 @@ concurrency:
 jobs:
   poll:
     runs-on: ubuntu-latest
-    permissions: { contents: read }
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+        with:
+          python-version: "3.11"
+
+      - name: Restore NJT token for today (NY date)
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.njt/token.json
+          key: njt-token-$(TZ=America/New_York date +%Y-%m-%d)
+
+      - name: Verify token exists (debug)
+        run: |
+          ls -l ~/.njt || true
+          head -c 120 ~/.njt/token.json || true
+
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install gtfs-realtime-bindings requests protobuf
+          pip install requests gtfs-realtime-bindings protobuf
+
       - name: Install rclone
         run: curl -fsSL https://rclone.org/install.sh | sudo bash
+
       - name: Configure rclone
-        env: 
-          RCLONE_CONF_B64: ${{ secrets.RCLONE_CONF_B64 }} 
+        env:
+          RCLONE_CONF_B64: ${{ secrets.RCLONE_CONF_B64 }}
         run: |
           mkdir -p ~/.config/rclone
           echo "$RCLONE_CONF_B64" | base64 -d > ~/.config/rclone/rclone.conf
           chmod 600 ~/.config/rclone/rclone.conf
-      - name: Ensure dirs
+          echo "[ok] rclone.conf installed"
+
+      - name: Ensure local/remote dirs
         env:
           GDRIVE_REMOTE_NAME: ${{ secrets.GDRIVE_REMOTE_NAME }}
           GDRIVE_DIR_NJT: ${{ vars.GDRIVE_DIR_NJT || 'penn-station/njt' }}
         run: |
           mkdir -p data/njt
           rclone mkdir "${GDRIVE_REMOTE_NAME}:${GDRIVE_DIR_NJT}/raw" || true
-      - name: Poll & append
+
+      - name: Poll & append NJT
         env:
-          NJT_RT_URL: ${{ vars.NJT_RT_URL }}
-          # Auth: basic OR token
-          NJT_USERNAME: ${{ secrets.NJT_USERNAME }}
-          NJT_PASSWORD: ${{ secrets.NJT_PASSWORD }}
-          NJT_API_TOKEN: ${{ secrets.NJT_API_TOKEN }}
-          NJT_STOP_ID: "105"
           GDRIVE_REMOTE_NAME: ${{ secrets.GDRIVE_REMOTE_NAME }}
           GDRIVE_DIR_NJT: ${{ vars.GDRIVE_DIR_NJT || 'penn-station/njt' }}
           NJT_MASTER_NAME: ${{ vars.NJT_MASTER_NAME || 'njt_penn_master.csv' }}
+          NJT_STOP_ID: "105"
+          # If NJT expects token as query param, set NJT_TOKEN_STYLE to "param":
+          NJT_TOKEN_STYLE: ${{ vars.NJT_TOKEN_STYLE || 'header' }}
+          # If you ever need to override the default endpoint:
+          NJT_TRIP_UPDATES_URL: ${{ vars.NJT_TRIP_UPDATES_URL }}
         run: python3 pollers/poll_njt.py
