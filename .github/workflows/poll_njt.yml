@@ -33,7 +33,8 @@ jobs:
       - name: Install rclone
         run: curl -fsSL https://rclone.org/install.sh | sudo bash
       - name: Configure rclone
-        env: { RCLONE_CONF_B64: ${{ secrets.RCLONE_CONF_B64 }} }
+        env: 
+          RCLONE_CONF_B64: ${{ secrets.RCLONE_CONF_B64 }} 
         run: |
           mkdir -p ~/.config/rclone
           echo "$RCLONE_CONF_B64" | base64 -d > ~/.config/rclone/rclone.conf
