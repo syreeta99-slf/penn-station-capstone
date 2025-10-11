@@ -31,7 +31,7 @@ jobs:
           cat > get_token.py <<'PY'
           import os
           import json 
-          import pathlib, 
+          import pathlib 
           import request
           import sys
 
