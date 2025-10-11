@@ -2,7 +2,7 @@ name: NJT Token (daily)
 
 on:
   schedule:
-    # ~00:05 America/New_York ≈ 04:05 UTC
+    # ~00:05 America/New_York ≈ 04:05 UTC (adjusts when DST changes)
     - cron: "5 4 * * *"
   workflow_dispatch: {}
 
@@ -22,80 +22,45 @@ jobs:
       - name: Create token dir
         run: mkdir -p ~/.njt
 
-      # Set these in repo Variables/Secrets:
-      #   NJT_TOKEN_URL      -> exact URL from Swagger for getToken (e.g. https://raildata.njtransit.com/RailDataWS/Authentication/getToken)
-      #   NJT_AUTH_STYLE     -> one of: body, basic
-      #   NJT_CLIENT_ID      -> secret
-      #   NJT_CLIENT_SECRET  -> secret
-      - name: Get NJT token
+      - name: Get NJT token (username/password -> UserToken)
         shell: bash
         env:
-          NJT_TOKEN_URL: ${{ vars.NJT_TOKEN_URL }}
-          NJT_AUTH_STYLE: ${{ vars.NJT_AUTH_STYLE || 'body' }}
-          NJT_CLIENT_ID: ${{ secrets.NJT_CLIENT_ID }}
-          NJT_CLIENT_SECRET: ${{ secrets.NJT_CLIENT_SECRET }}
+          NJT_USERNAME: ${{ secrets.NJT_USERNAME }}
+          NJT_PASSWORD: ${{ secrets.NJT_PASSWORD }}
+          NJT_TOKEN_URL: ${{ vars.NJT_TOKEN_URL || 'https://raildata.njtransit.com/api/GTFSRT/getToken' }}
         run: |
           cat > get_token.py <<'PY'
-import os, json, pathlib, requests, base64, sys
+import os, json, pathlib, requests, sys
+u = os.getenv("NJT_USERNAME"); p = os.getenv("NJT_PASSWORD"); url = os.getenv("NJT_TOKEN_URL")
+if not (u and p and url):
+    print("[fatal] Missing NJT_USERNAME/NJT_PASSWORD or NJT_TOKEN_URL", file=sys.stderr); sys.exit(2)
 
-url = os.getenv("NJT_TOKEN_URL")
-style = (os.getenv("NJT_AUTH_STYLE") or "body").lower()
-cid = os.getenv("NJT_CLIENT_ID")
-cs  = os.getenv("NJT_CLIENT_SECRET")
-
-if not url:
-    print("[fatal] NJT_TOKEN_URL is not set", file=sys.stderr); sys.exit(2)
-
-headers = {}
-data = None
-auth = None
-
-if style == "basic":
-    # Basic auth in header, no body unless Swagger says otherwise
-    auth = (cid, cs)
-    data = {}  # or None; adjust if Swagger shows required params
-else:
-    # Default: JSON body {client_id, client_secret}
-    headers["Content-Type"] = "application/json"
-    data = {"client_id": cid, "client_secret": cs}
-
-# Try POST first (most common); if Swagger says GET, change here.
-r = requests.post(url, json=data if headers.get("Content-Type")=="application/json" else None,
-                  data=None if headers.get("Content-Type")=="application/json" else data,
-                  headers=headers, auth=auth, timeout=30)
-
-print(f"[debug] status={r.status_code}")
-print(f"[debug] url={url}")
+# NJT expects multipart/form-data with fields: username, password
+files = {
+    "username": (None, u),
+    "password": (None, p),
+}
+r = requests.post(url, files=files, timeout=30)
+print("[debug] status", r.status_code)
 if r.status_code >= 400:
-    # show a small preview of body to help diagnose 404/401
-    print("[debug] body:", r.text[:300])
+    print(r.text[:400])
     r.raise_for_status()
 
-# token can be plain text or JSON; try JSON first
-tok_value = None
-try:
-    js = r.json()
-    for k in ("access_token","token","Token","AccessToken"):
-        if k in js and js[k]:
-            tok_value = js[k]
-            break
-    if tok_value is None:
-        # store the whole JSON; poller can pick correct key
-        token_payload = js
-    else:
-        token_payload = {"access_token": tok_value}
-except Exception:
-    # Fallback: plain text
-    token_payload = {"access_token": r.text.strip()}
+# Example JSON: {"Authenticated":"True","UserToken":"<token>"}
+js = r.json()
+token = js.get("UserToken") or js.get("token")
+if not token:
+    print("[fatal] No UserToken in response", js, file=sys.stderr); sys.exit(3)
 
-p = pathlib.Path.home() / ".njt" / "token.json"
-p.parent.mkdir(parents=True, exist_ok=True)
-p.write_text(json.dumps(token_payload))
-print("[ok] token saved to", p)
+out = {"UserToken": token}
+path = pathlib.Path.home()/".njt"/"token.json"
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(json.dumps(out))
+print("[ok] token saved to", path)
 PY
           python get_token.py
 
-      - name: Save token (date-keyed, New York timezone)
+      - name: Save token (cache, keyed by New York date)
         uses: actions/cache/save@v4
         with:
           path: ~/.njt/token.json
