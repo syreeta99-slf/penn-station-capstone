@@ -1,0 +1,59 @@
+name: Poll NJT (Penn 105) → Drive
+
+on:
+  schedule:
+    - cron: "30 10 * * *"
+    - cron: "0 11 * * *"
+    - cron: "30 11 * * *"
+    - cron: "0 12 * * *"
+    - cron: "0 16 * * *"
+    - cron: "0 18 * * *"
+    - cron: "30 20 * * *"
+    - cron: "0 21 * * *"
+    - cron: "30 21 * * *"
+    - cron: "0 2 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: poll-njt-append
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    permissions: { contents: read }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install gtfs-realtime-bindings requests protobuf
+      - name: Install rclone
+        run: curl -fsSL https://rclone.org/install.sh | sudo bash
+      - name: Configure rclone
+        env: { RCLONE_CONF_B64: ${{ secrets.RCLONE_CONF_B64 }} }
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "$RCLONE_CONF_B64" | base64 -d > ~/.config/rclone/rclone.conf
+          chmod 600 ~/.config/rclone/rclone.conf
+      - name: Ensure dirs
+        env:
+          GDRIVE_REMOTE_NAME: ${{ secrets.GDRIVE_REMOTE_NAME }}
+          GDRIVE_DIR_NJT: ${{ vars.GDRIVE_DIR_NJT || 'penn-station/njt' }}
+        run: |
+          mkdir -p data/njt
+          rclone mkdir "${GDRIVE_REMOTE_NAME}:${GDRIVE_DIR_NJT}/raw" || true
+      - name: Poll & append
+        env:
+          NJT_RT_URL: ${{ vars.NJT_RT_URL }}
+          # Auth: basic OR token
+          NJT_USERNAME: ${{ secrets.NJT_USERNAME }}
+          NJT_PASSWORD: ${{ secrets.NJT_PASSWORD }}
+          NJT_API_TOKEN: ${{ secrets.NJT_API_TOKEN }}
+          NJT_STOP_ID: "105"
+          GDRIVE_REMOTE_NAME: ${{ secrets.GDRIVE_REMOTE_NAME }}
+          GDRIVE_DIR_NJT: ${{ vars.GDRIVE_DIR_NJT || 'penn-station/njt' }}
+          NJT_MASTER_NAME: ${{ vars.NJT_MASTER_NAME || 'njt_penn_master.csv' }}
+        run: python3 pollers/poll_njt.py
