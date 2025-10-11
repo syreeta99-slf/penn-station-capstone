@@ -2,8 +2,7 @@ name: Poll NJT (Penn 105) → Drive
 
 on:
   schedule:
-    # Keep your existing 10/day or adjust as desired.
-    # Example: peak-heavy set you used previously:
+    # Example: 10/day peak-heavy. Adjust as you like.
     - cron: "30 10 * * *"
     - cron: "0 11 * * *"
     - cron: "30 11 * * *"
@@ -23,25 +22,17 @@ concurrency:
 jobs:
   poll:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    permissions: { contents: read }
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+        with: { python-version: "3.11" }
 
       - name: Restore NJT token for today (NY date)
         uses: actions/cache/restore@v4
         with:
           path: ~/.njt/token.json
           key: njt-token-$(TZ=America/New_York date +%Y-%m-%d)
-
-      - name: Verify token exists (debug)
-        run: |
-          ls -l ~/.njt || true
-          head -c 120 ~/.njt/token.json || true
 
       - name: Install deps
         run: |
@@ -74,8 +65,6 @@ jobs:
           GDRIVE_DIR_NJT: ${{ vars.GDRIVE_DIR_NJT || 'penn-station/njt' }}
           NJT_MASTER_NAME: ${{ vars.NJT_MASTER_NAME || 'njt_penn_master.csv' }}
           NJT_STOP_ID: "105"
-          # If NJT expects token as query param, set NJT_TOKEN_STYLE to "param":
-          NJT_TOKEN_STYLE: ${{ vars.NJT_TOKEN_STYLE || 'header' }}
-          # If you ever need to override the default endpoint:
-          NJT_TRIP_UPDATES_URL: ${{ vars.NJT_TRIP_UPDATES_URL }}
+          # If NJT ever changes path, override via repo variable:
+          NJT_GET_TRIP_UPDATES_URL: ${{ vars.NJT_GET_TRIP_UPDATES_URL || 'https://raildata.njtransit.com/api/GTFSRT/getTripUpdates' }}
         run: python3 pollers/poll_njt.py
