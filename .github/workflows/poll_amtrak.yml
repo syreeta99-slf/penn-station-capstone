@@ -2,7 +2,7 @@ name: Poll Amtrak (NYP) → Drive
 
 on:
   schedule:
-    # Off-peak: hourly (UTC), staggered a bit to avoid NJT collisions
+    # Off-peak hourly (UTC), slightly staggered from NJT
     - cron: "2 0-10,14-19,23 * * *"
     # AM peak 07:00–09:59 ET → 11:00–13:59 UTC (every 15 min, +2 min stagger)
     - cron: "2,17,32,47 11-13 * * *"
@@ -22,14 +22,14 @@ jobs:
       contents: read
     env:
       TZ: America/New_York
-      # Optional: only needed if your script supports schedule joins
-      AMTRAK_GTFS_ZIP: gtfs_static/Amtrak_GTFS.zip
       # Station filter (Moynihan / New York Penn)
       AMTRAK_STATION_CODE: NYP
-      # Drive folder for Amtrak (change if you keep a different structure)
+      # Drive folder & master name (adjust if you use different dirs)
       GDRIVE_DIR_AMTRAK: penn-station/amtrak
-      # Remote master filename on Drive (rolling append)
       AMTRAK_MASTER_NAME: amtrak_penn_master.csv
+      # Optional: only if your script joins schedules
+      AMTRAK_GTFS_ZIP: gtfs_static/Amtrak_GTFS.zip
+
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -47,29 +47,38 @@ jobs:
       - name: Ensure local dirs
         run: mkdir -p data/amtrak_rt/raw data/curated gtfs_static
 
-      - name: Install rclone
-        run: curl -fsSL https://rclone.org/install.sh | sudo bash
-
-      - name: Configure rclone
+      # --- rclone setup (only if secret exists) ---
+      - name: Install & configure rclone (if secret present)
         env:
           RCLONE_CONF_B64: ${{ secrets.RCLONE_CONF_B64 }}
         run: |
-          mkdir -p ~/.config/rclone
-          echo "$RCLONE_CONF_B64" | base64 -d > ~/.config/rclone/rclone.conf
-          chmod 600 ~/.config/rclone/rclone.conf
-          rclone --version
+          if [ -n "${RCLONE_CONF_B64:-}" ]; then
+            curl -fsSL https://rclone.org/install.sh | sudo bash
+            mkdir -p ~/.config/rclone
+            echo "$RCLONE_CONF_B64" | base64 -d > ~/.config/rclone/rclone.conf
+            chmod 600 ~/.config/rclone/rclone.conf
+            rclone --version
+          else
+            echo "RCLONE_CONF_B64 not set; skipping rclone install/config."
+          fi
 
-      - name: Ensure remote dirs
+      - name: Ensure remote dirs (if rclone configured)
         env:
-          GDRIVE_REMOTE_NAME: ${{ secrets.GDRIVE_REMOTE_NAME }} # e.g. "googledrive"
+          RCLONE_CONF_B64: ${{ secrets.RCLONE_CONF_B64 }}
+          GDRIVE_REMOTE_NAME: ${{ secrets.GDRIVE_REMOTE_NAME }}  # e.g. "googledrive"
           GDRIVE_DIR_AMTRAK: ${{ env.GDRIVE_DIR_AMTRAK }}
         run: |
-          rclone mkdir "${GDRIVE_REMOTE_NAME}:${GDRIVE_DIR_AMTRAK}/raw" || true
-          rclone mkdir "${GDRIVE_REMOTE_NAME}:${GDRIVE_DIR_AMTRAK}/curated" || true
+          if [ -n "${RCLONE_CONF_B64:-}" ]; then
+            rclone mkdir "${GDRIVE_REMOTE_NAME}:${GDRIVE_DIR_AMTRAK}/raw" || true
+            rclone mkdir "${GDRIVE_REMOTE_NAME}:${GDRIVE_DIR_AMTRAK}/curated" || true
+          else
+            echo "Skipping remote mkdir; no rclone secret."
+          fi
 
       - name: Poll & append Amtrak (NYP)
         env:
-          GDRIVE_REMOTE_NAME: ${{ secrets.GDRIVE_REMOTE_NAME }}
+          # your poller expects these:
+          GDRIVE_REMOTE_NAME: ${{ secrets.GDRIVE_REMOTE_NAME }}   # e.g. "googledrive"
           GDRIVE_DIR_AMTRAK: ${{ env.GDRIVE_DIR_AMTRAK }}
           AMTRAK_MASTER_NAME: ${{ env.AMTRAK_MASTER_NAME }}
           AMTRAK_STATION_CODE: ${{ env.AMTRAK_STATION_CODE }}
@@ -86,12 +95,16 @@ jobs:
           if-no-files-found: ignore
 
       - name: Copy local outputs to Drive (optional mirror)
-        if: ${{ secrets.RCLONE_CONF_B64 != '' }}
         env:
+          RCLONE_CONF_B64: ${{ secrets.RCLONE_CONF_B64 }}
           GDRIVE_REMOTE_NAME: ${{ secrets.GDRIVE_REMOTE_NAME }}
           GDRIVE_DIR_AMTRAK: ${{ env.GDRIVE_DIR_AMTRAK }}
         run: |
-          rclone copy data/amtrak_rt/raw "${GDRIVE_REMOTE_NAME}:${GDRIVE_DIR_AMTRAK}/raw" --transfers=8 --checkers=8 --fast-list || true
-          if [ -f "data/curated/master_interface_dataset_amtrak.csv" ]; then
-            rclone copy "data/curated/master_interface_dataset_amtrak.csv" "${GDRIVE_REMOTE_NAME}:${GDRIVE_DIR_AMTRAK}/curated" --transfers=2 --checkers=8 --fast-list || true
+          if [ -n "${RCLONE_CONF_B64:-}" ]; then
+            rclone copy data/amtrak_rt/raw "${GDRIVE_REMOTE_NAME}:${GDRIVE_DIR_AMTRAK}/raw" --transfers=8 --checkers=8 --fast-list || true
+            if [ -f "data/curated/master_interface_dataset_amtrak.csv" ]; then
+              rclone copy "data/curated/master_interface_dataset_amtrak.csv" "${GDRIVE_REMOTE_NAME}:${GDRIVE_DIR_AMTRAK}/curated" --transfers=2 --checkers=8 --fast-list || true
+            fi
+          else
+            echo "Skipping Drive mirror; no rclone secret."
           fi
