@@ -3,7 +3,7 @@
 Poll Amtrak (unofficial via Amtraker v3) for NYP, write timestamped raw CSV locally,
 ship raw to Google Drive, and append rows to a remote rolling master CSV on Drive.
 
-Matches the NJT poll pattern:
+Pattern:
 - local timestamped raw: data/amtrak_rt/raw/amtrak_rt_<STAMP>.csv
 - remote raw: <GDRIVE_REMOTE_NAME>:<GDRIVE_DIR_AMTRAK>/raw/...
 - remote master append: <GDRIVE_REMOTE_NAME>:<GDRIVE_DIR_AMTRAK>/<AMTRAK_MASTER_NAME>
@@ -19,6 +19,8 @@ ENV (set in workflow):
 
 import os, sys, csv, json, time, tempfile, pathlib, subprocess, datetime, urllib.request
 from typing import List, Dict, Any, Optional
+from datetime import datetime as dt, date
+from zoneinfo import ZoneInfo
 
 # -------- Config from env (align to NJT pattern) --------
 GDRIVE_REMOTE = os.getenv("GDRIVE_REMOTE_NAME")                         # required
@@ -32,6 +34,8 @@ STATIONS_URL = os.getenv("AMTRAKER_STATIONS_URL", "https://api-v3.amtraker.com/v
 OUT_DIR = pathlib.Path("data/amtrak_rt/raw")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
+NY_TZ = ZoneInfo("America/New_York")
+
 # Keep fields parallel to your NJT raw shape where it makes sense
 FIELDS = [
     "pull_utc","server_ts","train_number","route_name","station_code",
@@ -40,7 +44,7 @@ FIELDS = [
 
 # -------- Small utils --------
 def now_stamp() -> str:
-    return datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    return dt.utcnow().strftime("%Y%m%d_%H%M%S")
 
 def raw_filename() -> str:
     return f"amtrak_rt_{now_stamp()}.csv"
@@ -58,13 +62,49 @@ def http_json(url: str, retries: int = 2, timeout: int = 45) -> Any:
             time.sleep(1 + attempt * 2)
     raise last_err
 
+def parse_time_any(val) -> Optional[int]:
+    """
+    Normalize many time formats to epoch seconds (int, UTC-based):
+      - epoch seconds (int/float)
+      - epoch milliseconds (int/float, auto-divide)
+      - ISO8601 strings ("2025-10-13T14:23:00-04:00" or "...Z")
+      - 'HH:MM' strings (assumed *today* in America/New_York)
+    Returns None if cannot parse.
+    """
+    if val is None or val == "":
+        return None
+    if isinstance(val, (int, float)):
+        x = int(val)
+        # If likely ms (>> year 2033 in seconds), convert
+        return x // 1000 if x > 2_000_000_000 else x
+    s = str(val).strip()
+    # ISO8601
+    try:
+        iso = s.replace("Z", "+00:00")
+        dti = dt.fromisoformat(iso)
+        if dti.tzinfo is None:
+            dti = dti.replace(tzinfo=NY_TZ)
+        return int(dti.timestamp())
+    except Exception:
+        pass
+    # HH:MM
+    if ":" in s and len(s) <= 5:
+        try:
+            hh, mm = map(int, s.split(":")[:2])
+            dti = dt.combine(date.today(), dt.min.time(), NY_TZ).replace(hour=hh, minute=mm)
+            return int(dti.timestamp())
+        except Exception:
+            return None
+    return None
+
 def extract_rows(trains: Dict[str, Any], station_code: str) -> List[dict]:
     """
-    Build NJT-like rows from the Amtraker JSON. We only include trains whose stoplist contains station_code (NYP).
+    Build NJT-like rows from the Amtraker JSON. Only include trains whose stoplist contains station_code (NYP).
+    Robustly parse arrival/dep; fallback to scheduled when live is absent.
     """
     rows: List[dict] = []
     server_ts = int(time.time())
-    pull_utc = datetime.datetime.utcnow().isoformat(timespec="seconds")
+    pull_utc = dt.utcnow().isoformat(timespec="seconds")
 
     for train_num, variants in (trains or {}).items():
         if not isinstance(variants, list):
@@ -79,24 +119,35 @@ def extract_rows(trains: Dict[str, Any], station_code: str) -> List[dict]:
             if not nyp_stop:
                 continue
 
-            # Arrival/Departure may be epoch seconds when present
-            arr = nyp_stop.get("eta") or nyp_stop.get("estArr") or nyp_stop.get("arrival") or nyp_stop.get("estArrival")
-            dep = nyp_stop.get("etd") or nyp_stop.get("estDep") or nyp_stop.get("departure") or nyp_stop.get("estDeparture")
-
-            arrival_time = int(arr) if isinstance(arr, (int, float)) and arr > 10_000_000 else None
-            departure_time = int(dep) if isinstance(dep, (int, float)) and dep > 10_000_000 else None
+            # Collect lots of candidates; take first that parses
+            arr_candidates = [
+                nyp_stop.get("eta"), nyp_stop.get("estArr"),
+                nyp_stop.get("arrival"), nyp_stop.get("estArrival"),
+                nyp_stop.get("schArr")   # scheduled fallback
+            ]
+            dep_candidates = [
+                nyp_stop.get("etd"), nyp_stop.get("estDep"),
+                nyp_stop.get("departure"), nyp_stop.get("estDeparture"),
+                nyp_stop.get("schDep")   # scheduled fallback
+            ]
+            arrival_time = next((x for x in (parse_time_any(v) for v in arr_candidates) if x is not None), None)
+            departure_time = next((x for x in (parse_time_any(v) for v in dep_candidates) if x is not None), None)
 
             # delay: many variants expose "late" in minutes; convert to seconds if numeric
             late_min = t.get("late") or nyp_stop.get("late")
             delay_sec: Optional[int] = None
             try:
                 if late_min is not None:
-                    delay_sec = int(late_min) * 60
+                    delay_sec = int(float(late_min)) * 60
             except Exception:
                 delay_sec = None
 
             status = t.get("status") or t.get("lastVal") or ""
             entity_id = f"{train_num}_{idx}"  # stable per train object in this pull
+
+            # Optional debug: if times missing, print keys once (comment out in production)
+            # if not arrival_time and not departure_time:
+            #     print("[debug] NYP stop had no times; keys:", list(nyp_stop.keys()))
 
             rows.append({
                 "pull_utc": pull_utc,
@@ -167,7 +218,7 @@ def main():
     # Fetch live data (with light retry/backoff)
     trains = http_json(TRAINS_URL, retries=2)
 
-    # Build NYP-only rows
+    # Build NYP-only rows (robust parsing + scheduled fallback)
     rows = extract_rows(trains, STATION_CODE)
 
     # Write local timestamped raw
@@ -175,7 +226,7 @@ def main():
     write_csv(str(outpath), rows)
     print(f"[raw] wrote {len(rows)} rows → {outpath}")
 
-    # Copy raw to Drive raw folder
+    # Copy raw to Drive raw folder (best-effort)
     subprocess.run(
         ["rclone", "copyto", str(outpath), f"{GDRIVE_REMOTE}:{GDRIVE_DIR}/raw/{outpath.name}"],
         check=False
