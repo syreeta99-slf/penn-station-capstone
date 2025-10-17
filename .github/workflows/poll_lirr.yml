@@ -51,7 +51,7 @@ jobs:
       - name: Poll & append
         env:
           # --- Required/Recommended secrets/vars ---
-          LIRR_STOP_IDS: ${{ secrets.LIRR_STOP_IDS }}  # e.g., "237"
+          LIRR_STOP_IDS: ${{ vars.LIRR_STOP_IDS || '237' }}
           MTA_API_KEY: ${{ secrets.MTA_API_KEY }}      # same key as subway, if you have one
           LIRR_FEED_URL: "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/lirr%2Fgtfs-lirr"
 
