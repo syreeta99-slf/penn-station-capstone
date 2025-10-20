@@ -10,7 +10,7 @@ on:
 
 concurrency:
   group: poll-subway-append
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   poll:
