@@ -2,12 +2,10 @@ name: Poll MTA Subway (Penn) → Drive
 
 on:
   schedule:
-    # Hourly baseline at :05
-    - cron: "5 * * * *"
-    # AM peak 7–9 ET → 11–13 UTC (every 15 min)
-    - cron: "5,20,35,50 11-13 * * *"
-    # PM peak 16:30–18:30 ET → 20–22 UTC (every 15 min)
-    - cron: "5,20,35,50 20-22 * * *"
+    - cron: "5 * * * *"                   # hourly baseline (UTC)
+    - cron: "20,35,50 11-13 * * *"        # AM peak (7–9 ET)
+    - cron: "20,35,50 20-22 * * *"        # PM peak (4–6 ET)
+
   workflow_dispatch: {}
 
 concurrency:
