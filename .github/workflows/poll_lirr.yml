@@ -2,17 +2,14 @@ name: Poll MTA LIRR (Penn) → Drive
 
 on:
   schedule:
-    # Hourly baseline at :07 (staggered from Subway :05)
     - cron: "7 * * * *"
-    # AM peak 7–9 ET (11–13 UTC) every 15 min
-    - cron: "7,22,37,52 11-13 * * *"
-    # PM peak 16:30–18:30 ET (20–22 UTC) every 15 min
-    - cron: "7,22,37,52 20-22 * * *"
+    - cron: "22,37,52 11-13 * * *"
+    - cron: "22,37,52 20-22 * * *"
   workflow_dispatch: {}
 
 concurrency:
   group: poll-lirr-append
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   poll:
