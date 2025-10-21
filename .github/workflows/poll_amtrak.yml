@@ -13,7 +13,7 @@ on:
 
 concurrency:
   group: poll-amtrak-append
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   poll:
