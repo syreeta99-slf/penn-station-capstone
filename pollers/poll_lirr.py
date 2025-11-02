@@ -80,6 +80,18 @@ def write_csv(path: str, rows: List[dict]) -> None:
         w.writeheader()
         for r in rows:
             w.writerow(r)
+def add_event_fields(df: pd.DataFrame) -> pd.DataFrame:
+    # prefer departure for planning/connection logic; fall back to arrival
+    if "departure_time" in df.columns and "arrival_time" in df.columns:
+        df["event_time"] = df["departure_time"].where(df["departure_time"].notna(), df["arrival_time"])
+    else:
+        df["event_time"] = pd.NA
+
+    df["event_time"] = df["event_time"].astype("Int64")
+    df["event_ts_utc"] = pd.to_datetime(df["event_time"], unit="s", utc=True, errors="coerce")
+    df["event_kind"] = np.where(df.get("departure_time", pd.Series(dtype="Int64")).notna(), "DEP",
+                        np.where(df.get("arrival_time", pd.Series(dtype="Int64")).notna(), "ARR", pd.NA))
+    return df
 
 # ---------- stitching arrivals + departures ----------
 def stitch_arrival_departure(df_raw: pd.DataFrame,
@@ -310,6 +322,19 @@ def update_master_with_uid_rclone(local_new_df: pd.DataFrame) -> None:
         agg_spec = {c: _last_valid for c in combined.columns if c != "_uid"}
         collapsed = (combined.groupby("_uid", as_index=False).agg(agg_spec))
         collapsed = _add_readable_ts(collapsed)
+        collapsed = add_event_fields(collapsed)
+
+
+def _print_time_mix(df, label="LIRR"):
+    a = df["arrival_time"].notna() if "arrival_time" in df else pd.Series(dtype=bool)
+    d = df["departure_time"].notna() if "departure_time" in df else pd.Series(dtype=bool)
+    both = (a & d).mean() * 100
+    only_a = (a & ~d).mean() * 100
+    only_d = (~a & d).mean() * 100
+    none = (~a & ~d).mean() * 100
+    print(f"[{label}] both={both:.2f}% | only_arr={only_a:.2f}% | only_dep={only_d:.2f}% | none={none:.2f}%")
+
+_print_time_mix(collapsed, "LIRR master")
 
         collapsed.to_csv(local_master, index=False)
         subprocess.check_call(["rclone","copyto", local_master, remote_master])
