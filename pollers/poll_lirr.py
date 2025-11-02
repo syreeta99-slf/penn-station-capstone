@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, sys, csv, json, time, tempfile, pathlib, subprocess, datetime, requests
-from typing import Set, List
+import os, sys, csv, json, time, tempfile, subprocess, datetime, requests
+from typing import Set, List, Dict, Any, Optional
 from pathlib import Path
 from hashlib import md5
 
@@ -63,7 +63,7 @@ def rows_from_feed(feed: gtfs_realtime_pb2.FeedMessage, stops: Set[str]) -> List
                 "pull_utc": datetime.datetime.utcnow().isoformat(timespec="seconds"),
                 "server_ts": server_ts,
                 "trip_id": tu.trip.trip_id,
-                "route_id": tu.trip.route_id,  # may be blank for LIRR; keep for schema parity
+                "route_id": tu.trip.route_id,  # may be blank; keep for schema parity
                 "stop_id": stu.stop_id,
                 "arrival_time": arr,
                 "departure_time": dep,
@@ -81,6 +81,120 @@ def write_csv(path: str, rows: List[dict]) -> None:
         for r in rows:
             w.writerow(r)
 
+# ---------- stitching arrivals + departures ----------
+def stitch_arrival_departure(df_raw: pd.DataFrame,
+                             key_cols=("trip_id","stop_id"),
+                             arrival_col="arrival_time",
+                             departure_col="departure_time",
+                             tolerance_minutes=90) -> pd.DataFrame:
+    """
+    Combine arrival-only and departure-only rows into one event row per trip/stop.
+    Keeps singletons when no matching counterpart exists.
+    """
+    if df_raw.empty:
+        return df_raw.copy()
+
+    df = df_raw.copy()
+
+    # normalize types
+    for c in [arrival_col, departure_col, "server_ts", "delay_sec"]:
+        if c in df.columns:
+            df[c] = df[c].astype("Int64")
+    for c in list(key_cols) + ["route_id","schedule_relationship","entity_id","pull_utc","stop_id","trip_id"]:
+        if c in df.columns:
+            df[c] = df[c].astype("string")
+
+    arr = df[df[arrival_col].notna()].copy()
+    dep = df[df[departure_col].notna()].copy()
+
+    arr["_arr_ts"] = pd.to_datetime(arr[arrival_col], unit="s", utc=True, errors="coerce")
+    dep["_dep_ts"] = pd.to_datetime(dep[departure_col], unit="s", utc=True, errors="coerce")
+
+    if arr.empty and dep.empty:
+        return df
+
+    # sort for merge_asof
+    sort_keys = list(key_cols)
+    if not arr.empty:
+        arr = arr.sort_values(sort_keys + ["_arr_ts"])
+    if not dep.empty:
+        dep = dep.sort_values(sort_keys + ["_dep_ts"])
+
+    stitched = pd.merge_asof(
+        arr, dep,
+        left_on="_arr_ts", right_on="_dep_ts",
+        by=sort_keys,
+        direction="nearest",
+        tolerance=pd.Timedelta(minutes=tolerance_minutes),
+        suffixes=("", "_dep")
+    ) if (not arr.empty and not dep.empty) else arr.copy()
+
+    # valid pairs: both times exist and dep >= arr
+    if not stitched.empty and (departure_col + "_dep") in stitched.columns:
+        valid_pair = (
+            stitched[departure_col + "_dep"].notna() &
+            stitched[arrival_col].notna() &
+            (stitched[departure_col + "_dep"] >= stitched[arrival_col])
+        )
+        paired = stitched.loc[valid_pair].copy()
+    else:
+        paired = stitched.iloc[0:0].copy()
+
+    def coalesce(a, b):
+        return a.where(a.notna(), b)
+
+    out_cols = df.columns.tolist()
+    for tmpc in ("_arr_ts","_dep_ts"):
+        if tmpc in out_cols:
+            out_cols.remove(tmpc)
+    rows_out = []
+
+    # unified paired rows
+    if len(paired):
+        tmp = {}
+        for c in out_cols:
+            if c == arrival_col:
+                tmp[c] = paired[arrival_col]
+            elif c == departure_col and (departure_col + "_dep") in paired.columns:
+                tmp[c] = paired[departure_col + "_dep"]
+            elif c + "_dep" in paired.columns:
+                tmp[c] = coalesce(paired[c], paired[c + "_dep"])
+            else:
+                tmp[c] = paired[c] if c in paired.columns else pd.NA
+        rows_out.append(pd.DataFrame(tmp))
+
+    # unpaired arrivals
+    if not arr.empty:
+        matched_arr_ids = set(paired["entity_id"].dropna()) if ("entity_id" in paired.columns and len(paired)) else set()
+        ua = arr[~arr["entity_id"].isin(matched_arr_ids)] if "entity_id" in arr.columns else arr.iloc[0:0]
+        if len(ua):
+            rows_out.append(ua[out_cols])
+
+    # unpaired departures
+    if not dep.empty and "entity_id_dep" in (paired.columns if len(paired) else []):
+        matched_dep_ids = set(paired["entity_id_dep"].dropna())
+        ud = dep[~dep["entity_id"].isin(matched_dep_ids)] if "entity_id" in dep.columns else dep.iloc[0:0]
+        if len(ud):
+            rows_out.append(ud[out_cols])
+    elif not dep.empty and len(paired) == 0:
+        # no pairs at all -> keep departures as-is
+        rows_out.append(dep[out_cols])
+
+    out = pd.concat(rows_out, ignore_index=True) if rows_out else df.iloc[0:0].reindex(columns=out_cols)
+
+    # readable timestamps
+    out[arrival_col.replace("_time","_ts_utc")]   = pd.to_datetime(out[arrival_col],   unit="s", utc=True, errors="coerce")
+    out[departure_col.replace("_time","_ts_utc")] = pd.to_datetime(out[departure_col], unit="s", utc=True, errors="coerce")
+
+    # sanity: allow singletons; if both present, require dep >= arr
+    ok = (
+        out[departure_col].isna() |
+        out[arrival_col].isna() |
+        (out[departure_col] >= out[arrival_col])
+    )
+    out = out[ok].drop_duplicates(subset=list(key_cols) + [arrival_col, departure_col], keep="last")
+    return out.reset_index(drop=True)
+
 # ---------- _uid helpers ----------
 def get_event_epoch(row: dict):
     # Prefer explicit epoch times
@@ -96,7 +210,7 @@ def get_event_epoch(row: dict):
         v = row.get(k)
         if v is not None and str(v) != "":
             try:
-                return float(v)  # already epoch?
+                return float(v)
             except Exception:
                 try:
                     return pd.to_datetime(v, utc=True).view("int64")/1e9
@@ -118,15 +232,43 @@ def make_uid(row: dict) -> str:
     base = f"{SUBSYSTEM_TAG}|{stop_id}|{tripish}|{int(evt) if pd.notna(evt) else ''}"
     return md5(base.encode("utf-8")).hexdigest()
 
-# ---------- rclone-based master update ----------
+# ---------- rclone-based master update (coalescing) ----------
+def _last_valid(s: pd.Series):
+    s2 = s.dropna()
+    return s2.iloc[-1] if len(s2) else (s.iloc[-1] if len(s) else pd.NA)
+
+def _as_Int64(series: pd.Series) -> pd.Series:
+    try:
+        return series.astype("Int64")
+    except Exception:
+        return series
+
+def _add_readable_ts(df: pd.DataFrame) -> pd.DataFrame:
+    for col in ("arrival_time","departure_time"):
+        if col in df.columns:
+            out_col = col.replace("_time","_ts_utc")
+            df[out_col] = pd.to_datetime(df[col], unit="s", utc=True, errors="coerce")
+    return df
+
 def update_master_with_uid_rclone(local_new_df: pd.DataFrame) -> None:
     """
-    Download Drive master (if exists) -> concat -> ensure _uid -> dedup by _uid
-    (prefer latest server_ts) -> upload back to Drive.
+    Download Drive master (if exists) -> concat -> coalesce by _uid (latest non-null per column) -> upload.
     """
     if not GDRIVE_REMOTE or not GDRIVE_REMOTE.strip():
         print("GDRIVE_REMOTE_NAME is required.", file=sys.stderr)
         sys.exit(2)
+
+    # normalize types
+    for c in ("arrival_time","departure_time","server_ts","delay_sec"):
+        if c in local_new_df.columns:
+            local_new_df[c] = _as_Int64(local_new_df[c])
+    for c in ("trip_id","route_id","stop_id","schedule_relationship","entity_id","pull_utc"):
+        if c in local_new_df.columns:
+            local_new_df[c] = local_new_df[c].astype("string")
+
+    # Ensure _uid present
+    if "_uid" not in local_new_df.columns:
+        local_new_df["_uid"] = local_new_df.apply(lambda r: make_uid(r.to_dict()), axis=1)
 
     remote_master = f"{GDRIVE_REMOTE}:{GDRIVE_DIR}/{MASTER_NAME}"
     with tempfile.TemporaryDirectory() as td:
@@ -138,33 +280,40 @@ def update_master_with_uid_rclone(local_new_df: pd.DataFrame) -> None:
         )
 
         if pulled.returncode == 0 and os.path.exists(local_master):
-            df_master = pd.read_csv(local_master)
+            df_master = pd.read_csv(local_master, dtype={"trip_id":"string","route_id":"string",
+                                                         "stop_id":"string","schedule_relationship":"string",
+                                                         "entity_id":"string","pull_utc":"string","_uid":"string"},
+                                    low_memory=False)
         else:
             df_master = pd.DataFrame(columns=local_new_df.columns)
 
-        # Backfill _uid in existing master if missing
+        # Backfill _uid if missing historically
         if len(df_master) and "_uid" not in df_master.columns:
             df_master["_uid"] = df_master.apply(lambda r: make_uid(r.to_dict()), axis=1)
 
-        # Ensure new pull has _uid
-        if "_uid" not in local_new_df.columns:
-            local_new_df["_uid"] = local_new_df.apply(lambda r: make_uid(r.to_dict()), axis=1)
-
         # Align columns & union
         all_cols = sorted(set(df_master.columns) | set(local_new_df.columns))
-        df_master   = df_master.reindex(columns=all_cols)
-        local_new_df= local_new_df.reindex(columns=all_cols)
-
+        df_master    = df_master.reindex(columns=all_cols)
+        local_new_df = local_new_df.reindex(columns=all_cols)
         combined = pd.concat([df_master, local_new_df], ignore_index=True)
 
-        # Prefer most recent observation per _uid if server_ts present
+        # Sort and coalesce by _uid
         if "server_ts" in combined.columns:
-            combined = combined.sort_values("server_ts", na_position="last")
-        combined = combined.drop_duplicates(subset=["_uid"], keep="last")
+            combined["server_ts"] = _as_Int64(combined["server_ts"])
+        for c in ("arrival_time","departure_time","delay_sec"):
+            if c in combined.columns:
+                combined[c] = _as_Int64(combined[c])
 
-        combined.to_csv(local_master, index=False)
+        sort_cols = [c for c in ["_uid","server_ts"] if c in combined.columns]
+        combined = combined.sort_values(sort_cols)
+
+        agg_spec = {c: _last_valid for c in combined.columns if c != "_uid"}
+        collapsed = (combined.groupby("_uid", as_index=False).agg(agg_spec))
+        collapsed = _add_readable_ts(collapsed)
+
+        collapsed.to_csv(local_master, index=False)
         subprocess.check_call(["rclone","copyto", local_master, remote_master])
-        print(f"✅ {SUBSYSTEM_TAG} master now {len(combined)} rows at {GDRIVE_DIR}/{MASTER_NAME}")
+        print(f"✅ {SUBSYSTEM_TAG} master now {len(collapsed)} rows at {GDRIVE_DIR}/{MASTER_NAME}")
 
 # =========================
 # Main
@@ -184,23 +333,33 @@ def main():
         rows = []
 
     # 2) Raw snapshot (local + Drive)
-    outpath = os.path.join("data","lirr", out_name())
+    outpath = os.path.join("data","lirr","raw", out_name())
+    Path(outpath).parent.mkdir(parents=True, exist_ok=True)
     write_csv(outpath, rows)
     subprocess.run(
         ["rclone","copyto", outpath, f"{GDRIVE_REMOTE}:{GDRIVE_DIR}/raw/{os.path.basename(outpath)}"],
         check=False
     )
 
-    # 3) DataFrame for this pull → drop immediate dup rows → add _uid → update master
+    # 3) DataFrame for this pull → within-pull dedupe
     df_poll = pd.DataFrame(rows, columns=FIELDS)
-
-    # de-dupe identical rows within this pull (optional but helpful)
     dedupe_key = [c for c in ["stop_id","trip_id","entity_id","arrival_time","departure_time"] if c in df_poll.columns]
     if dedupe_key:
         df_poll = df_poll.drop_duplicates(subset=dedupe_key, keep="last")
 
-    # merge with Drive master (rclone), de-dup by _uid, upload back
-    update_master_with_uid_rclone(df_poll)
+    # 4) Stitch arrivals + departures into one event row per trip/stop
+    df_events = stitch_arrival_departure(df_poll,
+                                         key_cols=("trip_id","stop_id"),
+                                         arrival_col="arrival_time",
+                                         departure_col="departure_time",
+                                         tolerance_minutes=90)
+
+    # 5) Compute _uid AFTER stitching
+    if "_uid" not in df_events.columns:
+        df_events["_uid"] = df_events.apply(lambda r: make_uid(r.to_dict()), axis=1)
+
+    # 6) Update master on Drive with coalescing
+    update_master_with_uid_rclone(df_events)
 
     print(f"[ok] LIRR poll complete; stop_ids={sorted(LIRR_STOP_IDS)}")
 
