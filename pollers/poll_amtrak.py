@@ -4,7 +4,7 @@
 """
 Amtrak poller (via Amtraker v3) for NYP:
 - writes timestamped raw CSV locally and to Drive (/raw/)
-- merges into Drive master with stable _uid and de-dup (keep latest server_ts)
+- merges into Drive master with stable _uid and de-dup (coalesces latest non-null values)
 
 ENV (set in workflow):
   GDRIVE_REMOTE_NAME    e.g., "gdrive" (required)
@@ -12,10 +12,10 @@ ENV (set in workflow):
   AMTRAK_MASTER_NAME    e.g., "amtrak_penn_master.csv" (default)
   AMTRAK_STATION_CODE   default "NYP"
   AMTRAKER_TRAINS_URL   default "https://api-v3.amtraker.com/v3/trains"
-  AMTRAKER_STATIONS_URL default "https://api-v3.amtraker.com/v3/stations" (unused here but kept)
+  AMTRAKER_STATIONS_URL default "https://api-v3.amtraker.com/v3/stations" (unused)
 """
 
-import os, sys, csv, json, time, tempfile, pathlib, subprocess, datetime, urllib.request
+import os, sys, csv, json, time, tempfile, subprocess
 from typing import List, Dict, Any, Optional
 from datetime import datetime as dt, date
 from pathlib import Path
@@ -54,6 +54,7 @@ def http_json(url: str, retries: int = 2, timeout: int = 45) -> Any:
     last_err = None
     for attempt in range(retries + 1):
         try:
+            import urllib.request
             req = urllib.request.Request(url, headers={"User-Agent":"capstone-noncommercial"})
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 return json.loads(r.read())
@@ -149,6 +150,7 @@ def write_csv(path: str, rows: List[dict]) -> None:
 
 # ---------------- _uid helpers ----------------
 def get_event_epoch(row: dict):
+    # Prefer arrival/departure/event_epoch if present; else fallback to server_ts/pull_utc
     for k in ("arrival_time","departure_time","event_epoch"):
         v = row.get(k)
         if v is not None and str(v) != "":
@@ -182,11 +184,42 @@ def make_uid(row: dict) -> str:
     base    = f"{SUBSYSTEM_TAG}|{stopish}|{tripish}|{int(evt) if pd.notna(evt) else ''}"
     return md5(base.encode("utf-8")).hexdigest()
 
+# ---------------- Helpers for safe coalescing ----------------
+def _last_valid(s: pd.Series):
+    s2 = s.dropna()
+    return s2.iloc[-1] if len(s2) else (s.iloc[-1] if len(s) else pd.NA)
+
+def _as_int64(series: pd.Series) -> pd.Series:
+    # keep pandas nullable Int64 (not numpy int64) to preserve NA
+    try:
+        return series.astype("Int64")
+    except Exception:
+        return series
+
+def _add_readable_ts(df: pd.DataFrame) -> pd.DataFrame:
+    for col in ("arrival_time","departure_time"):
+        if col in df.columns:
+            out_col = col.replace("_time","_ts_utc")
+            df[out_col] = pd.to_datetime(df[col], unit="s", utc=True, errors="coerce")
+    return df
+
 # ---------------- rclone-based master update ----------------
 def update_master_with_uid_rclone(local_new_df: pd.DataFrame) -> None:
     if not GDRIVE_REMOTE or not GDRIVE_REMOTE.strip():
         print("GDRIVE_REMOTE_NAME is required.", file=sys.stderr)
         sys.exit(2)
+
+    # Normalize dtypes on new pull
+    for c in ("arrival_time","departure_time","server_ts","delay_sec"):
+        if c in local_new_df.columns:
+            local_new_df[c] = _as_int64(local_new_df[c])
+    for c in ("train_number","route_name","station_code","status","entity_id","pull_utc"):
+        if c in local_new_df.columns:
+            local_new_df[c] = local_new_df[c].astype("string")
+
+    # Ensure new pull has _uid
+    if "_uid" not in local_new_df.columns:
+        local_new_df["_uid"] = local_new_df.apply(lambda r: make_uid(r.to_dict()), axis=1)
 
     remote_master = f"{GDRIVE_REMOTE}:{GDRIVE_DIR}/{MASTER_NAME}"
     with tempfile.TemporaryDirectory() as td:
@@ -197,18 +230,22 @@ def update_master_with_uid_rclone(local_new_df: pd.DataFrame) -> None:
             ["rclone","copyto", remote_master, local_master],
             capture_output=True, text=True
         )
+
         if pulled.returncode == 0 and os.path.exists(local_master):
-            df_master = pd.read_csv(local_master)
+            # Read with minimal inference; we’ll recast below
+            df_master = pd.read_csv(local_master, dtype={"train_number":"string",
+                                                         "route_name":"string",
+                                                         "station_code":"string",
+                                                         "status":"string",
+                                                         "entity_id":"string",
+                                                         "_uid":"string"},
+                                    low_memory=False)
         else:
             df_master = pd.DataFrame(columns=local_new_df.columns)
 
         # Backfill _uid if missing in existing master
         if len(df_master) and "_uid" not in df_master.columns:
             df_master["_uid"] = df_master.apply(lambda r: make_uid(r.to_dict()), axis=1)
-
-        # Ensure new pull has _uid
-        if "_uid" not in local_new_df.columns:
-            local_new_df["_uid"] = local_new_df.apply(lambda r: make_uid(r.to_dict()), axis=1)
 
         # Align columns & union
         all_cols = sorted(set(df_master.columns) | set(local_new_df.columns))
@@ -217,14 +254,37 @@ def update_master_with_uid_rclone(local_new_df: pd.DataFrame) -> None:
 
         combined = pd.concat([df_master, local_new_df], ignore_index=True)
 
-        # Prefer newest server_ts per _uid
+        # Sort so later rows have newer server_ts; then coalesce by _uid using "last valid" values
         if "server_ts" in combined.columns:
-            combined = combined.sort_values("server_ts", na_position="last")
-        combined = combined.drop_duplicates(subset=["_uid"], keep="last")
+            combined["server_ts"] = _as_int64(combined["server_ts"])
+        for c in ("arrival_time","departure_time","delay_sec"):
+            if c in combined.columns:
+                combined[c] = _as_int64(combined[c])
 
-        combined.to_csv(local_master, index=False)
-        subprocess.check_call(["rclone","copyto", local_master, remote_master])
-        print(f"✅ amtrak master now {len(combined)} rows at {GDRIVE_DIR}/{MASTER_NAME}")
+        # ensure deterministic order before coalescing
+        sort_cols = [c for c in ["_uid","server_ts"] if c in combined.columns]
+        combined = combined.sort_values(sort_cols)
+
+        # Build aggregation spec: use _last_valid for everything except pull_utc (keep last string)
+        agg_spec = {}
+        for c in combined.columns:
+            if c == "_uid":
+                continue
+            # for string / numeric alike, prefer last non-null; if all null, keep last (possibly null)
+            agg_spec[c] = _last_valid
+
+        collapsed = (combined
+                     .groupby("_uid", as_index=False)
+                     .agg(agg_spec))
+
+        # Re-add readable timestamps for convenience
+        collapsed = _add_readable_ts(collapsed)
+
+        # Persist
+        local_master_tmp = local_master  # overwrite in place
+        collapsed.to_csv(local_master_tmp, index=False)
+        subprocess.check_call(["rclone","copyto", local_master_tmp, remote_master])
+        print(f"✅ amtrak master now {len(collapsed)} rows at {GDRIVE_DIR}/{MASTER_NAME}")
 
 # ---------------- Main ----------------
 def main():
@@ -246,7 +306,7 @@ def main():
         check=False
     )
 
-    # 4) Build DF, drop intra-pull duplicates, add _uid, and update master on Drive
+    # 4) Build DF, drop intra-pull dupes, add _uid, and update master on Drive
     df_poll = pd.DataFrame(rows, columns=FIELDS)
 
     # Drop identical rows within this pull (optional)
