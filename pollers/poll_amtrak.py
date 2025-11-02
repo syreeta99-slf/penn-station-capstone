@@ -92,6 +92,7 @@ def parse_time_any(val) -> Optional[int]:
             return None
     return None
 
+# ---------------- Row extraction ----------------
 def extract_rows(trains: Dict[str, Any], station_code: str) -> List[dict]:
     rows: List[dict] = []
     server_ts = int(time.time())
@@ -265,23 +266,22 @@ def update_master_with_uid_rclone(local_new_df: pd.DataFrame) -> None:
         sort_cols = [c for c in ["_uid","server_ts"] if c in combined.columns]
         combined = combined.sort_values(sort_cols)
 
-        # Build aggregation spec: use _last_valid for everything except pull_utc (keep last string)
+        # Build aggregation spec: prefer last non-null per column
         agg_spec = {}
         for c in combined.columns:
             if c == "_uid":
                 continue
-            # for string / numeric alike, prefer last non-null; if all null, keep last (possibly null)
             agg_spec[c] = _last_valid
 
         collapsed = (combined
                      .groupby("_uid", as_index=False)
                      .agg(agg_spec))
 
-        # Re-add readable timestamps for convenience
+        # Add readable timestamps for convenience
         collapsed = _add_readable_ts(collapsed)
 
         # Persist
-        local_master_tmp = local_master  # overwrite in place
+        local_master_tmp = local_master
         collapsed.to_csv(local_master_tmp, index=False)
         subprocess.check_call(["rclone","copyto", local_master_tmp, remote_master])
         print(f"✅ amtrak master now {len(collapsed)} rows at {GDRIVE_DIR}/{MASTER_NAME}")
@@ -309,7 +309,7 @@ def main():
     # 4) Build DF, drop intra-pull dupes, add _uid, and update master on Drive
     df_poll = pd.DataFrame(rows, columns=FIELDS)
 
-    # Drop identical rows within this pull (optional)
+    # Optional within-pull de-dupe
     dedupe_key = [c for c in ["station_code","train_number","entity_id","arrival_time","departure_time"] if c in df_poll.columns]
     if dedupe_key:
         df_poll = df_poll.drop_duplicates(subset=dedupe_key, keep="last")
