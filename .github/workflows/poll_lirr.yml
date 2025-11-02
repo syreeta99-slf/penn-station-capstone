@@ -2,9 +2,9 @@ name: Poll MTA LIRR (Penn) → Drive
 
 on:
   schedule:
-    - cron: "7 * * * *"
-    - cron: "22,37,52 11-13 * * *"
-    - cron: "22,37,52 20-22 * * *"
+    - cron: "7 * * * *"            # every hour at :07 (UTC)
+    - cron: "22,37,52 11-13 * * *" # note: UTC windows
+    - cron: "22,37,52 20-22 * * *" # note: UTC windows
   workflow_dispatch: {}
 
 concurrency:
@@ -14,12 +14,17 @@ concurrency:
 jobs:
   poll:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions: { contents: read }
+    env:
+      TZ: America/New_York    # for readable timestamps in logs only
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+        with:
+          python-version: "3.11"
+          cache: "pip"
 
       - name: Install deps
         run: |
@@ -37,22 +42,34 @@ jobs:
           echo "$RCLONE_CONF_B64" | base64 -d > ~/.config/rclone/rclone.conf
           chmod 600 ~/.config/rclone/rclone.conf
 
-      - name: Ensure dirs
+      - name: Ensure dirs (local + Drive)
         env:
           GDRIVE_REMOTE_NAME: ${{ secrets.GDRIVE_REMOTE_NAME }}
           GDRIVE_DIR_LIRR: ${{ vars.GDRIVE_DIR_LIRR || 'penn-station/lirr' }}
         run: |
-          mkdir -p data/lirr
+          mkdir -p data/lirr/raw
           rclone mkdir "${GDRIVE_REMOTE_NAME}:${GDRIVE_DIR_LIRR}/raw" || true
 
       - name: Poll & append
+        id: poll
         env:
-          # --- Required/Recommended secrets/vars ---
+          # Required/Recommended
           LIRR_STOP_IDS: ${{ vars.LIRR_STOP_IDS || '237' }}
-          MTA_API_KEY: ${{ secrets.MTA_API_KEY }}      # same key as subway, if you have one
+          MTA_API_KEY:   ${{ secrets.MTA_API_KEY }}
           LIRR_FEED_URL: "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/lirr%2Fgtfs-lirr"
-
           GDRIVE_REMOTE_NAME: ${{ secrets.GDRIVE_REMOTE_NAME }}
-          GDRIVE_DIR_LIRR: ${{ vars.GDRIVE_DIR_LIRR || 'penn-station/lirr' }}
-          LIRR_MASTER_NAME: ${{ vars.LIRR_MASTER_NAME || 'lirr_penn_master.csv' }}
-        run: python3 pollers/poll_lirr.py
+          GDRIVE_DIR_LIRR:    ${{ vars.GDRIVE_DIR_LIRR || 'penn-station/lirr' }}
+          LIRR_MASTER_NAME:   ${{ vars.LIRR_MASTER_NAME || 'lirr_penn_master.csv' }}
+        run: |
+          echo ">> stop_ids=$LIRR_STOP_IDS  gdrive_dir=$GDRIVE_DIR_LIRR  master=$LIRR_MASTER_NAME"
+          python3 pollers/poll_lirr.py
+
+      # Optional but useful: keep the latest raw CSV as an artifact for quick inspection
+      - name: Upload raw snapshot artifact (optional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lirr_raw_latest
+          path: |
+            data/lirr/raw/*
+          if-no-files-found: ignore
