@@ -1,0 +1,5 @@
+pandas==2.2.2
+numpy==2.0.2
+requests>=2.31,<3
+protobuf>=4.23,<6
+gtfs-realtime-bindings==1.0.0
