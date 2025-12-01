@@ -1,8 +1,7 @@
 name: Sweep past 7 days of NJT & Subway realtime CSVs
 
 on:
-  schedule:
-    - cron: "15 5 * * *"   # daily at 05:15 UTC
+
   workflow_dispatch: {}
 
 jobs:
